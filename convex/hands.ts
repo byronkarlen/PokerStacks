@@ -723,3 +723,216 @@ export const awardPot = mutation({
     return null;
   },
 });
+
+// =============================================================================
+// undoLastAction (host) — reverses the most recent reversible event
+// =============================================================================
+
+export const undoLastAction = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await ctx.db.get(args.tableId);
+    if (!table) throw new Error("Table not found");
+    if (table.hostDeviceId !== args.deviceId) throw new Error("Host only");
+
+    // Find the most recent hand at this table.
+    const recent = await ctx.db
+      .query("hands")
+      .withIndex("by_table_and_number", (q) => q.eq("tableId", args.tableId))
+      .order("desc")
+      .take(1);
+    const hand = recent[0];
+    if (!hand) throw new Error("No hand to undo");
+    if (hand.voided) throw new Error("Hand was voided — cannot undo");
+
+    const now = Date.now();
+
+    // Case 1: pot-award undo. Hand is complete with a non-voided result.
+    if (hand.street === "complete") {
+      const result = await ctx.db
+        .query("handResults")
+        .withIndex("by_hand", (q) => q.eq("handId", hand._id))
+        .unique();
+      if (result && !result.voided) {
+        // Reverse the stack credits.
+        for (const award of result.awards) {
+          const seat = await ctx.db.get(award.seatId);
+          if (!seat) continue;
+          await ctx.db.patch(seat._id, {
+            chipStack: seat.chipStack - award.amount,
+          });
+        }
+        await ctx.db.patch(result._id, { voided: true, voidedAt: now });
+        await ctx.db.patch(hand._id, {
+          street: "showdown",
+          completedAt: undefined,
+        });
+        await ctx.db.patch(table._id, { currentHandId: hand._id });
+        await ctx.db.insert("hostEvents", {
+          tableId: table._id,
+          byDeviceId: args.deviceId,
+          type: "undo_pot_award",
+          payload: { handId: hand._id },
+          createdAt: now,
+        });
+        return { kind: "pot_award" as const };
+      }
+    }
+
+    // Case 2: action undo. Find the last non-undone action of this hand.
+    const allActions = await ctx.db
+      .query("actions")
+      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+      .order("desc")
+      .collect();
+    const last = allActions.find((a) => !a.undone);
+    if (!last) throw new Error("No action to undo");
+
+    // Don't allow undoing the auto-posted blinds (they'd leave the hand in a
+    // half-set-up state). Hosts wanting to abandon a hand should void it.
+    if (last.type === "post_sb" || last.type === "post_bb") {
+      throw new Error("Cannot undo blinds — void the hand instead");
+    }
+
+    // Mark undone and credit chips back.
+    await ctx.db.patch(last._id, {
+      undone: true,
+      undoneAt: now,
+      undoneByDeviceId: args.deviceId,
+    });
+    if (last.amount > 0) {
+      const seat = await ctx.db.get(last.seatId);
+      if (seat) {
+        await ctx.db.patch(seat._id, {
+          chipStack: seat.chipStack + last.amount,
+        });
+      }
+    }
+
+    // Recompute hand state from the remaining live actions.
+    const remaining = allActions.filter(
+      (a) => a._id !== last._id && !a.undone,
+    );
+    let pot = 0;
+    const committedByStreet: Record<string, Record<Id<"seats">, number>> = {
+      preflop: {},
+      flop: {},
+      turn: {},
+      river: {},
+    };
+    let highestStreetReached: Street = "preflop";
+    const streetOrder: Street[] = ["preflop", "flop", "turn", "river"];
+    for (const a of remaining) {
+      pot += a.amount;
+      const s = a.street as Street;
+      committedByStreet[s][a.seatId] =
+        (committedByStreet[s][a.seatId] ?? 0) + a.amount;
+      if (streetOrder.indexOf(s) > streetOrder.indexOf(highestStreetReached)) {
+        highestStreetReached = s;
+      }
+    }
+
+    // The new "current street" is the street of the action we just undid.
+    const newStreet = last.street as Street;
+    const streetCommits = committedByStreet[newStreet];
+    const newCurrentBet = Math.max(0, ...Object.values(streetCommits));
+    const newToAct = last.seatIndex;
+
+    await ctx.db.patch(hand._id, {
+      pot,
+      currentBet: newCurrentBet,
+      minRaise: table.bigBlind,
+      street: newStreet,
+      toActSeatIndex: newToAct,
+      completedAt: undefined,
+    });
+    await ctx.db.patch(table._id, { currentHandId: hand._id });
+
+    await ctx.db.insert("hostEvents", {
+      tableId: table._id,
+      byDeviceId: args.deviceId,
+      type: "undo_action",
+      payload: {
+        handId: hand._id,
+        actionId: last._id,
+        actionType: last.type,
+        amount: last.amount,
+      },
+      createdAt: now,
+    });
+
+    return { kind: "action" as const };
+  },
+});
+
+// =============================================================================
+// voidHand (host) — abandon the current hand, restore all stacks
+// =============================================================================
+
+export const voidHand = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await ctx.db.get(args.tableId);
+    if (!table) throw new Error("Table not found");
+    if (table.hostDeviceId !== args.deviceId) throw new Error("Host only");
+    if (!table.currentHandId) throw new Error("No active hand");
+
+    const hand = await ctx.db.get(table.currentHandId);
+    if (!hand) throw new Error("Hand not found");
+    if (hand.voided) throw new Error("Already voided");
+
+    // Restore every stack by crediting back what each seat committed
+    // across all non-undone actions of this hand.
+    const all = await ctx.db
+      .query("actions")
+      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+      .collect();
+    const refund = new Map<Id<"seats">, number>();
+    for (const a of all) {
+      if (a.undone) continue;
+      refund.set(a.seatId, (refund.get(a.seatId) ?? 0) + a.amount);
+    }
+    for (const [seatId, amount] of refund) {
+      const seat = await ctx.db.get(seatId);
+      if (!seat) continue;
+      await ctx.db.patch(seat._id, { chipStack: seat.chipStack + amount });
+    }
+
+    // If a result existed (mid-undo state), void it too so the credits
+    // don't get double-applied.
+    const result = await ctx.db
+      .query("handResults")
+      .withIndex("by_hand", (q) => q.eq("handId", hand._id))
+      .unique();
+    if (result && !result.voided) {
+      // Reverse the credits before voiding.
+      for (const award of result.awards) {
+        const seat = await ctx.db.get(award.seatId);
+        if (!seat) continue;
+        await ctx.db.patch(seat._id, {
+          chipStack: seat.chipStack - award.amount,
+        });
+      }
+      await ctx.db.patch(result._id, { voided: true, voidedAt: Date.now() });
+    }
+
+    const now = Date.now();
+    await ctx.db.patch(hand._id, {
+      voided: true,
+      street: "complete",
+      completedAt: now,
+      toActSeatIndex: undefined,
+    });
+    await ctx.db.patch(table._id, { currentHandId: undefined });
+
+    await ctx.db.insert("hostEvents", {
+      tableId: table._id,
+      byDeviceId: args.deviceId,
+      type: "void_hand",
+      payload: { handId: hand._id },
+      createdAt: now,
+    });
+
+    return null;
+  },
+});

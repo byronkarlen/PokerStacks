@@ -274,3 +274,170 @@ export const startGame = mutation({
     return null;
   },
 });
+
+// Host-only: add chips to an active seat. Allowed only between hands per §6.5.
+export const rebuySeat = mutation({
+  args: {
+    deviceId: v.string(),
+    seatId: v.id("seats"),
+    amount: v.number(),
+  },
+  handler: async (ctx, args) => {
+    if (args.amount <= 0) throw new Error("Amount must be positive");
+
+    const seat = await ctx.db.get(args.seatId);
+    if (!seat) throw new Error("Seat not found");
+
+    const table = await requireHost(ctx, seat.tableId, args.deviceId);
+
+    if (table.currentHandId) {
+      throw new Error("Cannot rebuy mid-hand — wait until the next hand");
+    }
+
+    if (seat.status !== "active" && seat.status !== "sitting_out") {
+      throw new Error("Seat must be active or sitting out to rebuy");
+    }
+
+    await ctx.db.patch(seat._id, { chipStack: seat.chipStack + args.amount });
+
+    const now = Date.now();
+    await ctx.db.insert("transactions", {
+      tableId: seat.tableId,
+      seatId: seat._id,
+      type: "rebuy",
+      amount: args.amount,
+      createdAt: now,
+    });
+    await ctx.db.insert("hostEvents", {
+      tableId: seat.tableId,
+      byDeviceId: args.deviceId,
+      type: "rebuy",
+      payload: { seatId: seat._id, amount: args.amount },
+      createdAt: now,
+    });
+
+    return null;
+  },
+});
+
+// Host-only: remove a player from the table. Their remaining stack is recorded
+// as an implicit cash-out for settlement. Mid-hand kicks leave already-
+// committed chips in the pot (effectively a fold).
+export const kickPlayer = mutation({
+  args: { deviceId: v.string(), seatId: v.id("seats") },
+  handler: async (ctx, args) => {
+    const seat = await ctx.db.get(args.seatId);
+    if (!seat) throw new Error("Seat not found");
+
+    const table = await requireHost(ctx, seat.tableId, args.deviceId);
+
+    if (seat.deviceId === table.hostDeviceId) {
+      throw new Error("Host cannot kick themselves — transfer host first");
+    }
+
+    if (seat.status === "kicked" || seat.status === "cashed_out") {
+      throw new Error("Seat already removed");
+    }
+
+    const now = Date.now();
+    const remainingChips = seat.chipStack;
+
+    await ctx.db.patch(seat._id, { status: "kicked", chipStack: 0 });
+
+    if (remainingChips > 0) {
+      await ctx.db.insert("transactions", {
+        tableId: seat.tableId,
+        seatId: seat._id,
+        type: "cash_out",
+        amount: remainingChips,
+        createdAt: now,
+      });
+    }
+
+    await ctx.db.insert("hostEvents", {
+      tableId: seat.tableId,
+      byDeviceId: args.deviceId,
+      type: "kick",
+      payload: { seatId: seat._id, remainingChips },
+      createdAt: now,
+    });
+
+    return null;
+  },
+});
+
+// Host-only: manually adjust a seat's chip stack with a logged reason.
+export const editStack = mutation({
+  args: {
+    deviceId: v.string(),
+    seatId: v.id("seats"),
+    newAmount: v.number(),
+    reason: v.string(),
+  },
+  handler: async (ctx, args) => {
+    if (args.newAmount < 0) throw new Error("Amount cannot be negative");
+    if (args.reason.trim().length === 0) throw new Error("Reason required");
+
+    const seat = await ctx.db.get(args.seatId);
+    if (!seat) throw new Error("Seat not found");
+
+    await requireHost(ctx, seat.tableId, args.deviceId);
+
+    const before = seat.chipStack;
+    await ctx.db.patch(seat._id, { chipStack: args.newAmount });
+
+    const now = Date.now();
+    await ctx.db.insert("stackEdits", {
+      tableId: seat.tableId,
+      seatId: seat._id,
+      byDeviceId: args.deviceId,
+      before,
+      after: args.newAmount,
+      reason: args.reason.trim(),
+      createdAt: now,
+    });
+    await ctx.db.insert("hostEvents", {
+      tableId: seat.tableId,
+      byDeviceId: args.deviceId,
+      type: "edit_stack",
+      payload: {
+        seatId: seat._id,
+        before,
+        after: args.newAmount,
+        reason: args.reason.trim(),
+      },
+      createdAt: now,
+    });
+
+    return null;
+  },
+});
+
+// Host-only: transfer the host role to another active seat at the table.
+export const transferHost = mutation({
+  args: { deviceId: v.string(), toSeatId: v.id("seats") },
+  handler: async (ctx, args) => {
+    const target = await ctx.db.get(args.toSeatId);
+    if (!target) throw new Error("Seat not found");
+
+    const table = await requireHost(ctx, target.tableId, args.deviceId);
+
+    if (target.deviceId === table.hostDeviceId) {
+      throw new Error("Already the host");
+    }
+    if (target.status !== "active" && target.status !== "sitting_out") {
+      throw new Error("Target seat is not playable");
+    }
+
+    await ctx.db.patch(table._id, { hostDeviceId: target.deviceId });
+    await ctx.db.insert("hostEvents", {
+      tableId: table._id,
+      byDeviceId: args.deviceId,
+      type: "transfer_host",
+      payload: { toSeatId: target._id, toDeviceId: target.deviceId },
+      createdAt: Date.now(),
+    });
+
+    return null;
+  },
+});

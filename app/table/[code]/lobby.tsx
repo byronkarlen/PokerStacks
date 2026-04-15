@@ -78,6 +78,15 @@ export default function Lobby() {
           <Text style={styles.hint}>
             Share this with your friends so they can join.
           </Text>
+          {isHost ? (
+            <Pressable
+              onPress={() => router.push(`/table/${code}/settings`)}
+              style={styles.settingsLink}
+              hitSlop={8}
+            >
+              <Text style={styles.settingsLinkText}>Settings</Text>
+            </Pressable>
+          ) : null}
         </View>
 
         <Text style={[styles.label, { marginTop: 24 }]}>
@@ -286,6 +295,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginTop: 12,
     textAlign: "center",
+  },
+  settingsLink: {
+    marginTop: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+  },
+  settingsLinkText: {
+    color: theme.textMuted,
+    fontSize: 14,
+    textDecorationLine: "underline",
   },
   subtitle: {
     color: theme.textMuted,

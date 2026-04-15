@@ -41,7 +41,9 @@ export default function HandScreen() {
   );
 
   const startHand = useMutation(api.hands.startHand);
+  const undoLastAction = useMutation(api.hands.undoLastAction);
   const [startError, setStartError] = useState<string | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
 
   // Auto-route on table state changes.
   useEffect(() => {
@@ -75,15 +77,43 @@ export default function HandScreen() {
     }
   }
 
+  async function handleUndo() {
+    setUndoError(null);
+    try {
+      await undoLastAction({ deviceId: deviceId!, tableId: table!._id });
+    } catch (e) {
+      setUndoError(e instanceof Error ? e.message : "Undo failed");
+    }
+  }
+
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <ScrollView contentContainerStyle={styles.scroll}>
         <View style={styles.header}>
           <Text style={styles.code}>{table.code}</Text>
-          <Text style={styles.streetLabel}>
-            {hand ? streetLabel(hand) : "Between hands"}
-          </Text>
+          <View style={{ flexDirection: "row", gap: 12 }}>
+            <Text style={styles.streetLabel}>
+              {hand ? streetLabel(hand) : "Between hands"}
+            </Text>
+            {isHost ? (
+              <Pressable
+                onPress={() => router.push(`/table/${code}/settings`)}
+                hitSlop={12}
+              >
+                <Text style={styles.menuButton}>⚙</Text>
+              </Pressable>
+            ) : null}
+          </View>
         </View>
+
+        {isHost && hand && !hand.voided ? (
+          <View style={styles.undoRow}>
+            <Pressable onPress={handleUndo} style={styles.undoBtn}>
+              <Text style={styles.undoBtnText}>Undo last action</Text>
+            </Pressable>
+            {undoError ? <Text style={styles.error}>{undoError}</Text> : null}
+          </View>
+        ) : null}
 
         <PotSection hand={hand} />
 
@@ -928,4 +958,18 @@ const styles = StyleSheet.create({
   },
   modalConfirm: { backgroundColor: theme.accent },
   modalButtonText: { color: theme.bg, fontWeight: "700", fontSize: 16 },
+  menuButton: { color: theme.text, fontSize: 18 },
+  undoRow: {
+    marginTop: 12,
+    alignItems: "flex-end",
+  },
+  undoBtn: {
+    backgroundColor: theme.surface,
+    borderColor: theme.warning,
+    borderWidth: 1,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  undoBtnText: { color: theme.warning, fontWeight: "700", fontSize: 13 },
 });
