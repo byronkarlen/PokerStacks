@@ -3,8 +3,10 @@ import { Doc, Id } from "@/convex/_generated/dataModel";
 import { colorHex, theme } from "@/lib/colors";
 import { useDeviceId } from "@/lib/deviceId";
 import { useMutation, useQuery } from "convex/react";
+import * as Haptics from "expo-haptics";
+import { useKeepAwake } from "expo-keep-awake";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Modal,
   Pressable,
@@ -25,6 +27,7 @@ type Action = Doc<"actions">;
 // =============================================================================
 
 export default function HandScreen() {
+  useKeepAwake();
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
   const code = (codeParam ?? "").toUpperCase();
@@ -55,6 +58,40 @@ export default function HandScreen() {
     }
   }, [table?.status, code, router]);
 
+  // Haptic on "your turn" arrival and on hand completion.
+  const lastToActRef = useRef<number | undefined>(undefined);
+  const lastStreetRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const hand = handView?.hand;
+    const mySeatIndex = (handView && deviceId)
+      ? seats?.find((s) => s.deviceId === deviceId)?.seatIndex
+      : undefined;
+
+    const newToAct = hand?.toActSeatIndex;
+    if (
+      newToAct !== undefined &&
+      newToAct === mySeatIndex &&
+      lastToActRef.current !== newToAct
+    ) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(
+        () => {},
+      );
+    }
+    lastToActRef.current = newToAct;
+
+    const newStreet = hand?.street;
+    if (
+      newStreet === "complete" &&
+      lastStreetRef.current !== "complete" &&
+      lastStreetRef.current !== undefined
+    ) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => {},
+      );
+    }
+    lastStreetRef.current = newStreet;
+  }, [handView, seats, deviceId]);
+
   if (!table || !seats || handView === undefined || !deviceId) {
     return (
       <SafeAreaView style={styles.container}>
@@ -71,6 +108,7 @@ export default function HandScreen() {
 
   async function handleStartHand() {
     setStartError(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     try {
       await startHand({ deviceId: deviceId!, tableId: table!._id });
     } catch (e) {
@@ -80,6 +118,9 @@ export default function HandScreen() {
 
   async function handleUndo() {
     setUndoError(null);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(
+      () => {},
+    );
     try {
       await undoLastAction({ deviceId: deviceId!, tableId: table!._id });
     } catch (e) {
@@ -531,6 +572,7 @@ function MyTurnDock({
   ) {
     setError(null);
     setBusy(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     try {
       await recordAction({
         deviceId,

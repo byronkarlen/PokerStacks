@@ -3,6 +3,8 @@ import { Doc, Id } from "@/convex/_generated/dataModel";
 import { colorHex, theme } from "@/lib/colors";
 import { useDeviceId } from "@/lib/deviceId";
 import { useMutation, useQuery } from "convex/react";
+import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -43,6 +45,7 @@ export default function Lobby() {
 
   const [buyInTarget, setBuyInTarget] = useState<SeatWithProfile | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const isHost = !!table && !!deviceId && table.hostDeviceId === deviceId;
   const activeCount = useMemo(
@@ -62,6 +65,7 @@ export default function Lobby() {
   async function handleStart() {
     if (!deviceId || !table) return;
     setStartError(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     try {
       await startGame({ deviceId, tableId: table._id });
     } catch (e) {
@@ -69,15 +73,31 @@ export default function Lobby() {
     }
   }
 
+  async function handleCopyCode() {
+    if (!table) return;
+    await Clipboard.setStringAsync(table.code);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
       <ScrollView contentContainerStyle={styles.scroll}>
         <View style={styles.header}>
           <Text style={styles.label}>Table code</Text>
-          <Text style={styles.code}>{table.code}</Text>
-          <Text style={styles.hint}>
-            Share this with your friends so they can join.
-          </Text>
+          <Pressable onPress={handleCopyCode} hitSlop={12}>
+            <Text style={styles.code}>{table.code}</Text>
+          </Pressable>
+          <Pressable
+            onPress={handleCopyCode}
+            style={styles.copyHint}
+            hitSlop={8}
+          >
+            <Text style={styles.hint}>
+              {copied ? "Copied!" : "Tap code to copy"}
+            </Text>
+          </Pressable>
           {isHost ? (
             <Pressable
               onPress={() => router.push(`/table/${code}/settings`)}
@@ -293,8 +313,12 @@ const styles = StyleSheet.create({
   hint: {
     color: theme.textMuted,
     fontSize: 14,
-    marginTop: 12,
     textAlign: "center",
+  },
+  copyHint: {
+    marginTop: 12,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
   },
   settingsLink: {
     marginTop: 16,
