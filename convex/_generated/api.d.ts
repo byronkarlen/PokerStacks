@@ -8,13 +8,21 @@
  * @module
  */
 
+import type * as devices from "../devices.js";
+import type * as hands from "../hands.js";
+import type * as tables from "../tables.js";
+
 import type {
   ApiFromModules,
   FilterApi,
   FunctionReference,
 } from "convex/server";
 
-declare const fullApi: ApiFromModules<{}>;
+declare const fullApi: ApiFromModules<{
+  devices: typeof devices;
+  hands: typeof hands;
+  tables: typeof tables;
+}>;
 
 /**
  * A utility for referencing Convex functions in your app's public API.
