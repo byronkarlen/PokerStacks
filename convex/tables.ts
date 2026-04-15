@@ -516,3 +516,203 @@ export const cashOut = mutation({
     return null;
   },
 });
+
+// =============================================================================
+// endGame (host) — terminate the session, settle outstanding seats
+// =============================================================================
+
+export const endGame = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await requireHost(ctx, args.tableId, args.deviceId);
+    if (table.status === "ended") throw new Error("Already ended");
+
+    const now = Date.now();
+
+    // 1. Void any active hand (refunds bets to seats).
+    if (table.currentHandId) {
+      const hand = await ctx.db.get(table.currentHandId);
+      if (hand && !hand.voided) {
+        const all = await ctx.db
+          .query("actions")
+          .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+          .collect();
+        const refund = new Map<Id<"seats">, number>();
+        for (const a of all) {
+          if (a.undone) continue;
+          refund.set(a.seatId, (refund.get(a.seatId) ?? 0) + a.amount);
+        }
+        for (const [seatId, amount] of refund) {
+          const seat = await ctx.db.get(seatId);
+          if (!seat) continue;
+          await ctx.db.patch(seat._id, { chipStack: seat.chipStack + amount });
+        }
+        // Also void any pre-existing result.
+        const result = await ctx.db
+          .query("handResults")
+          .withIndex("by_hand", (q) => q.eq("handId", hand._id))
+          .unique();
+        if (result && !result.voided) {
+          for (const award of result.awards) {
+            const seat = await ctx.db.get(award.seatId);
+            if (!seat) continue;
+            await ctx.db.patch(seat._id, {
+              chipStack: seat.chipStack - award.amount,
+            });
+          }
+          await ctx.db.patch(result._id, { voided: true, voidedAt: now });
+        }
+        await ctx.db.patch(hand._id, {
+          voided: true,
+          street: "complete",
+          completedAt: now,
+          toActSeatIndex: undefined,
+        });
+      }
+      await ctx.db.patch(table._id, { currentHandId: undefined });
+    }
+
+    // 2. Auto-cash-out remaining seats (active and sitting_out) at current stack.
+    const seats = await ctx.db
+      .query("seats")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+    for (const seat of seats) {
+      if (seat.status !== "active" && seat.status !== "sitting_out") continue;
+      const remaining = seat.chipStack;
+      await ctx.db.patch(seat._id, { status: "cashed_out", chipStack: 0 });
+      if (remaining > 0) {
+        await ctx.db.insert("transactions", {
+          tableId: args.tableId,
+          seatId: seat._id,
+          type: "cash_out",
+          amount: remaining,
+          createdAt: now,
+        });
+      }
+    }
+
+    // 3. Mark the table ended.
+    await ctx.db.patch(table._id, { status: "ended", endedAt: now });
+
+    await ctx.db.insert("hostEvents", {
+      tableId: table._id,
+      byDeviceId: args.deviceId,
+      type: "end_game",
+      payload: {},
+      createdAt: now,
+    });
+
+    return null;
+  },
+});
+
+// =============================================================================
+// getSettlement — per-seat net and minimal-transfer payment plan
+// =============================================================================
+
+export const getSettlement = query({
+  args: { tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await ctx.db.get(args.tableId);
+    if (!table) return null;
+
+    const seats = await ctx.db
+      .query("seats")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+    const transactions = await ctx.db
+      .query("transactions")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+
+    // Per-seat aggregates.
+    type Row = {
+      seatId: Id<"seats">;
+      deviceId: string;
+      displayName: string;
+      color: string;
+      buyIns: number; // includes initial + rebuys
+      cashOuts: number;
+      net: number;
+    };
+
+    const rows: Row[] = await Promise.all(
+      seats
+        .filter((s) => s.status !== "pending_buy_in")
+        .map(async (seat) => {
+          const tx = transactions.filter((t) => t.seatId === seat._id);
+          const buyIns = tx
+            .filter((t) => t.type === "buy_in" || t.type === "rebuy")
+            .reduce((acc, t) => acc + t.amount, 0);
+          const cashOuts = tx
+            .filter((t) => t.type === "cash_out")
+            .reduce((acc, t) => acc + t.amount, 0);
+          const device = await ctx.db
+            .query("devices")
+            .withIndex("by_device", (q) => q.eq("deviceId", seat.deviceId))
+            .unique();
+          return {
+            seatId: seat._id,
+            deviceId: seat.deviceId,
+            displayName: device?.displayName ?? "?",
+            color: device?.color ?? "blue",
+            buyIns,
+            cashOuts,
+            net: cashOuts - buyIns,
+          };
+        }),
+    );
+
+    rows.sort((a, b) => b.net - a.net);
+
+    // Minimal-transfer greedy: pair largest debtor with largest creditor.
+    type Transfer = {
+      fromSeatId: Id<"seats">;
+      toSeatId: Id<"seats">;
+      fromName: string;
+      toName: string;
+      amount: number;
+    };
+
+    const debtors = rows
+      .filter((r) => r.net < 0)
+      .map((r) => ({ ...r, owed: -r.net }))
+      .sort((a, b) => b.owed - a.owed);
+    const creditors = rows
+      .filter((r) => r.net > 0)
+      .map((r) => ({ ...r, due: r.net }))
+      .sort((a, b) => b.due - a.due);
+
+    const transfers: Transfer[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < debtors.length && j < creditors.length) {
+      const d = debtors[i];
+      const c = creditors[j];
+      const amount = Math.min(d.owed, c.due);
+      if (amount > 0) {
+        transfers.push({
+          fromSeatId: d.seatId,
+          toSeatId: c.seatId,
+          fromName: d.displayName,
+          toName: c.displayName,
+          amount,
+        });
+        d.owed -= amount;
+        c.due -= amount;
+      }
+      if (d.owed === 0) i++;
+      if (c.due === 0) j++;
+    }
+
+    const sumNet = rows.reduce((acc, r) => acc + r.net, 0);
+
+    return {
+      table,
+      rows,
+      transfers,
+      sumNetMismatch: sumNet, // should be 0; non-zero indicates a data issue
+    };
+  },
+});

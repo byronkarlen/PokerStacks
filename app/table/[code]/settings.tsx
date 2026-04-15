@@ -32,12 +32,16 @@ export default function Settings() {
   );
 
   const voidHand = useMutation(api.hands.voidHand);
+  const endGame = useMutation(api.tables.endGame);
 
   const [actionTarget, setActionTarget] = useState<{
     seat: SeatWithProfile;
     kind: ModalKind;
   } | null>(null);
   const [voidError, setVoidError] = useState<string | null>(null);
+  const [endConfirmOpen, setEndConfirmOpen] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
+  const [endingBusy, setEndingBusy] = useState(false);
 
   if (!table || !seats || !deviceId) {
     return (
@@ -66,6 +70,18 @@ export default function Settings() {
     }
   }
 
+  async function handleEndGame() {
+    setEndError(null);
+    setEndingBusy(true);
+    try {
+      await endGame({ deviceId: deviceId!, tableId: table!._id });
+      router.replace(`/table/${code}/settle`);
+    } catch (e) {
+      setEndError(e instanceof Error ? e.message : "End-game failed");
+      setEndingBusy(false);
+    }
+  }
+
   const handInProgress = !!table.currentHandId;
 
   return (
@@ -86,7 +102,7 @@ export default function Settings() {
         {voidError ? <Text style={styles.error}>{voidError}</Text> : null}
 
         <Pressable
-          onPress={() => router.push(`/table/${code}/end`)}
+          onPress={() => setEndConfirmOpen(true)}
           style={[styles.dangerCard, { marginTop: 8 }]}
         >
           <Text style={styles.dangerCardTitle}>End game</Text>
@@ -113,6 +129,47 @@ export default function Settings() {
         defaultBuyIn={table.defaultBuyIn}
         onClose={() => setActionTarget(null)}
       />
+
+      <Modal
+        animationType="fade"
+        transparent
+        visible={endConfirmOpen}
+        onRequestClose={() => setEndConfirmOpen(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>End game?</Text>
+            <Text style={styles.modalSubtitle}>
+              Everyone is cashed out at their current stack and the
+              settlement screen opens. This can't be undone.
+            </Text>
+            {endError ? <Text style={styles.error}>{endError}</Text> : null}
+            <View style={styles.modalActions}>
+              <Pressable
+                onPress={() => setEndConfirmOpen(false)}
+                style={[styles.modalButton, styles.modalCancel]}
+              >
+                <Text style={[styles.modalButtonText, { color: theme.text }]}>
+                  Cancel
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={handleEndGame}
+                disabled={endingBusy}
+                style={[
+                  styles.modalButton,
+                  { backgroundColor: theme.danger },
+                  endingBusy && styles.seatBtnDisabled,
+                ]}
+              >
+                <Text style={styles.modalButtonText}>
+                  {endingBusy ? "…" : "End game"}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
