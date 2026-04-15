@@ -441,3 +441,78 @@ export const transferHost = mutation({
     return null;
   },
 });
+
+// =============================================================================
+// Player self-service: sitOut / sitIn / cashOut
+// =============================================================================
+
+async function requireBetweenHands(
+  ctx: QueryCtx | MutationCtx,
+  tableId: Id<"tables">,
+) {
+  const table = await ctx.db.get(tableId);
+  if (table?.currentHandId) {
+    throw new Error("Wait until the current hand ends");
+  }
+}
+
+export const sitOut = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    if (seat.status !== "active") {
+      throw new Error("Only an active seat can sit out");
+    }
+    await requireBetweenHands(ctx, args.tableId);
+    await ctx.db.patch(seat._id, { status: "sitting_out" });
+    return null;
+  },
+});
+
+export const sitIn = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    if (seat.status !== "sitting_out") {
+      throw new Error("Seat is not sitting out");
+    }
+    await requireBetweenHands(ctx, args.tableId);
+    await ctx.db.patch(seat._id, { status: "active" });
+    return null;
+  },
+});
+
+export const cashOut = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    const table = await ctx.db.get(args.tableId);
+    if (!table) throw new Error("Table not found");
+
+    if (seat.status === "cashed_out" || seat.status === "kicked") {
+      throw new Error("Already left the table");
+    }
+
+    // Host must transfer the role before cashing out so the table isn't orphaned.
+    if (table.hostDeviceId === args.deviceId) {
+      throw new Error("Transfer host before cashing out");
+    }
+
+    await requireBetweenHands(ctx, args.tableId);
+
+    const remaining = seat.chipStack;
+    await ctx.db.patch(seat._id, { status: "cashed_out", chipStack: 0 });
+
+    if (remaining > 0) {
+      await ctx.db.insert("transactions", {
+        tableId: args.tableId,
+        seatId: seat._id,
+        type: "cash_out",
+        amount: remaining,
+        createdAt: Date.now(),
+      });
+    }
+
+    return null;
+  },
+});

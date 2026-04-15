@@ -44,6 +44,7 @@ export default function HandScreen() {
   const undoLastAction = useMutation(api.hands.undoLastAction);
   const [startError, setStartError] = useState<string | null>(null);
   const [undoError, setUndoError] = useState<string | null>(null);
+  const [meMenuOpen, setMeMenuOpen] = useState(false);
 
   // Auto-route on table state changes.
   useEffect(() => {
@@ -91,10 +92,13 @@ export default function HandScreen() {
       <ScrollView contentContainerStyle={styles.scroll}>
         <View style={styles.header}>
           <Text style={styles.code}>{table.code}</Text>
-          <View style={{ flexDirection: "row", gap: 12 }}>
+          <View style={{ flexDirection: "row", gap: 16, alignItems: "center" }}>
             <Text style={styles.streetLabel}>
               {hand ? streetLabel(hand) : "Between hands"}
             </Text>
+            <Pressable onPress={() => setMeMenuOpen(true)} hitSlop={12}>
+              <Text style={styles.menuButton}>Me</Text>
+            </Pressable>
             {isHost ? (
               <Pressable
                 onPress={() => router.push(`/table/${code}/settings`)}
@@ -139,7 +143,124 @@ export default function HandScreen() {
         deviceId={deviceId}
         onStartHand={handleStartHand}
       />
+
+      <MeMenu
+        open={meMenuOpen}
+        onClose={() => setMeMenuOpen(false)}
+        mySeat={mySeat ?? null}
+        tableId={table._id}
+        deviceId={deviceId}
+        isHost={isHost}
+      />
     </SafeAreaView>
+  );
+}
+
+// =============================================================================
+// MeMenu — sit out / sit in / cash out for the current player
+// =============================================================================
+
+function MeMenu({
+  open,
+  onClose,
+  mySeat,
+  tableId,
+  deviceId,
+  isHost,
+}: {
+  open: boolean;
+  onClose: () => void;
+  mySeat: SeatWithProfile | null;
+  tableId: Id<"tables">;
+  deviceId: string;
+  isHost: boolean;
+}) {
+  const router = useRouter();
+  const sitOut = useMutation(api.tables.sitOut);
+  const sitIn = useMutation(api.tables.sitIn);
+  const cashOut = useMutation(api.tables.cashOut);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open || !mySeat) return null;
+
+  async function run<T>(fn: () => Promise<T>, after?: () => void) {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      onClose();
+      after?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal animationType="fade" transparent visible onRequestClose={onClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <Text style={styles.modalTitle}>You · {mySeat.chipStack} chips</Text>
+
+          {mySeat.status === "active" ? (
+            <Pressable
+              onPress={() => run(() => sitOut({ deviceId, tableId }))}
+              disabled={busy}
+              style={[styles.menuItem, busy && styles.ctaDisabled]}
+            >
+              <Text style={styles.menuItemText}>Sit out next hand</Text>
+            </Pressable>
+          ) : null}
+
+          {mySeat.status === "sitting_out" ? (
+            <Pressable
+              onPress={() => run(() => sitIn({ deviceId, tableId }))}
+              disabled={busy}
+              style={[styles.menuItem, busy && styles.ctaDisabled]}
+            >
+              <Text style={styles.menuItemText}>Sit back in</Text>
+            </Pressable>
+          ) : null}
+
+          {mySeat.status !== "cashed_out" && mySeat.status !== "kicked" ? (
+            <Pressable
+              onPress={() =>
+                run(
+                  () => cashOut({ deviceId, tableId }),
+                  () => router.replace("/"),
+                )
+              }
+              disabled={busy || isHost}
+              style={[
+                styles.menuItem,
+                styles.menuItemDanger,
+                (busy || isHost) && styles.ctaDisabled,
+              ]}
+            >
+              <Text style={[styles.menuItemText, { color: theme.danger }]}>
+                Cash out & leave
+              </Text>
+              {isHost ? (
+                <Text style={styles.muted}>Transfer host first</Text>
+              ) : null}
+            </Pressable>
+          ) : null}
+
+          {error ? <Text style={styles.error}>{error}</Text> : null}
+
+          <Pressable
+            onPress={onClose}
+            style={[styles.menuItem, { backgroundColor: "transparent" }]}
+          >
+            <Text style={[styles.menuItemText, { color: theme.textMuted }]}>
+              Close
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -972,4 +1093,18 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   undoBtnText: { color: theme.warning, fontWeight: "700", fontSize: 13 },
+  menuItem: {
+    backgroundColor: theme.surfaceElevated,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    marginTop: 10,
+    alignItems: "center",
+  },
+  menuItemDanger: {
+    borderColor: theme.danger,
+    borderWidth: 1,
+    backgroundColor: "transparent",
+  },
+  menuItemText: { color: theme.text, fontSize: 16, fontWeight: "600" },
 });
