@@ -239,6 +239,57 @@ export const getPotStructure = query({
   },
 });
 
+/**
+ * Returns up to N completed (or voided) hands at this table, newest first,
+ * each bundled with its action stream and result. For the history screen.
+ */
+export const getHandHistory = query({
+  args: { tableId: v.id("tables"), limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = args.limit ?? 100;
+    const hands = await ctx.db
+      .query("hands")
+      .withIndex("by_table_and_number", (q) => q.eq("tableId", args.tableId))
+      .order("desc")
+      .take(limit);
+
+    return await Promise.all(
+      hands.map(async (hand) => {
+        const actions = await ctx.db
+          .query("actions")
+          .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+          .collect();
+        const result = await ctx.db
+          .query("handResults")
+          .withIndex("by_hand", (q) => q.eq("handId", hand._id))
+          .unique();
+        return { hand, actions, result };
+      }),
+    );
+  },
+});
+
+/**
+ * Combined audit timeline of host events and stack edits. Newest first.
+ */
+export const getAuditLog = query({
+  args: { tableId: v.id("tables"), limit: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const limit = args.limit ?? 100;
+    const hostEvents = await ctx.db
+      .query("hostEvents")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .order("desc")
+      .take(limit);
+    const stackEdits = await ctx.db
+      .query("stackEdits")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .order("desc")
+      .take(limit);
+    return { hostEvents, stackEdits };
+  },
+});
+
 // Lightweight bundle for the active hand UI: hand + all live actions + result.
 export const getHandView = query({
   args: { tableId: v.id("tables") },

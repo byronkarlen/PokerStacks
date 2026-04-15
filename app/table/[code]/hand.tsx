@@ -96,6 +96,12 @@ export default function HandScreen() {
             <Text style={styles.streetLabel}>
               {hand ? streetLabel(hand) : "Between hands"}
             </Text>
+            <Pressable
+              onPress={() => router.push(`/table/${code}/history`)}
+              hitSlop={12}
+            >
+              <Text style={styles.menuButton}>Log</Text>
+            </Pressable>
             <Pressable onPress={() => setMeMenuOpen(true)} hitSlop={12}>
               <Text style={styles.menuButton}>Me</Text>
             </Pressable>

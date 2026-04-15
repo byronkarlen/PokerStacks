@@ -102,6 +102,16 @@ export default function Settings() {
         {voidError ? <Text style={styles.error}>{voidError}</Text> : null}
 
         <Pressable
+          onPress={() => router.push(`/table/${code}/history`)}
+          style={[styles.linkCard, { marginTop: 8 }]}
+        >
+          <Text style={styles.linkCardTitle}>Hand history</Text>
+          <Text style={styles.dangerCardSub}>
+            Review every hand played at this table.
+          </Text>
+        </Pressable>
+
+        <Pressable
           onPress={() => setEndConfirmOpen(true)}
           style={[styles.dangerCard, { marginTop: 8 }]}
         >
@@ -487,6 +497,14 @@ const styles = StyleSheet.create({
   },
   dangerCardTitle: { color: theme.danger, fontSize: 16, fontWeight: "700" },
   dangerCardSub: { color: theme.textMuted, fontSize: 13, marginTop: 4 },
+  linkCard: {
+    backgroundColor: theme.surface,
+    borderColor: theme.border,
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 16,
+  },
+  linkCardTitle: { color: theme.text, fontSize: 16, fontWeight: "700" },
   seatCard: {
     backgroundColor: theme.surface,
     borderColor: theme.border,
