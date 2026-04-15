@@ -150,6 +150,95 @@ export const getHandResult = query({
   },
 });
 
+/**
+ * Compute the pot structure for a hand, applying the side-pot algorithm from
+ * plan §11. Returns an array of pots ordered smallest side pot first, main
+ * pot last. Each pot lists its amount and the seat IDs eligible to win it
+ * (non-folded, with at least the pot's commitment level).
+ */
+export const getPotStructure = query({
+  args: { handId: v.id("hands") },
+  handler: async (ctx, args) => {
+    const hand = await ctx.db.get(args.handId);
+    if (!hand) return null;
+
+    const all = await ctx.db
+      .query("actions")
+      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+      .collect();
+    const live = all.filter((a) => !a.undone);
+
+    // Per-seat totals across the whole hand.
+    const total = new Map<Id<"seats">, number>();
+    const folded = new Set<Id<"seats">>();
+    const allInSet = new Set<Id<"seats">>();
+    for (const a of live) {
+      total.set(a.seatId, (total.get(a.seatId) ?? 0) + a.amount);
+      if (a.type === "fold") folded.add(a.seatId);
+      if (a.type === "all_in") allInSet.add(a.seatId);
+    }
+
+    // Distinct all-in commitment levels, ascending.
+    const allInLevels = Array.from(
+      new Set(
+        Array.from(allInSet).map((sid) => total.get(sid) ?? 0).filter((v) => v > 0),
+      ),
+    ).sort((a, b) => a - b);
+
+    type Pot = {
+      index: number;
+      amount: number;
+      eligibleSeatIds: Id<"seats">[];
+      isMain: boolean;
+    };
+
+    const pots: Pot[] = [];
+    let prev = 0;
+    let potIndex = 0;
+
+    // Side pots (one per distinct all-in level, smallest first).
+    for (const level of allInLevels) {
+      const contributorsAtLevel = Array.from(total.entries()).filter(
+        ([, t]) => t >= level,
+      );
+      const amount = (level - prev) * contributorsAtLevel.length;
+      if (amount > 0) {
+        const eligible = contributorsAtLevel
+          .filter(([sid]) => !folded.has(sid))
+          .map(([sid]) => sid);
+        pots.push({ index: potIndex++, amount, eligibleSeatIds: eligible, isMain: false });
+      }
+      prev = level;
+    }
+
+    // Main pot: chips bet ABOVE the highest all-in level by non-all-in seats.
+    const mainContribs = Array.from(total.entries()).filter(
+      ([sid, t]) => !allInSet.has(sid) && t > prev,
+    );
+    const mainAmount = mainContribs.reduce((acc, [, t]) => acc + (t - prev), 0);
+    if (mainAmount > 0) {
+      const eligible = mainContribs
+        .filter(([sid]) => !folded.has(sid))
+        .map(([sid]) => sid);
+      pots.push({ index: potIndex++, amount: mainAmount, eligibleSeatIds: eligible, isMain: true });
+    }
+
+    // No all-ins, no main side pots — degenerate "no pots" case shouldn't happen
+    // for a real hand. Fallback: a single pot with everyone non-folded eligible.
+    if (pots.length === 0 && hand.pot > 0) {
+      const eligible = Array.from(total.keys()).filter((sid) => !folded.has(sid));
+      pots.push({
+        index: 0,
+        amount: hand.pot,
+        eligibleSeatIds: eligible,
+        isMain: true,
+      });
+    }
+
+    return { pot: hand.pot, pots };
+  },
+});
+
 // Lightweight bundle for the active hand UI: hand + all live actions + result.
 export const getHandView = query({
   args: { tableId: v.id("tables") },

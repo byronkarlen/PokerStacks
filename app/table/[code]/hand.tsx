@@ -294,7 +294,6 @@ function ActionDock({
     return (
       <ShowdownDock
         hand={hand}
-        actions={actions}
         seats={seats}
         deviceId={deviceId}
       />
@@ -577,55 +576,75 @@ function BetModal({
 
 function ShowdownDock({
   hand,
-  actions,
   seats,
   deviceId,
 }: {
   hand: Hand;
-  actions: Action[];
   seats: SeatWithProfile[];
   deviceId: string;
 }) {
   const awardPot = useMutation(api.hands.awardPot);
-  const [picked, setPicked] = useState<Set<Id<"seats">>>(new Set());
+  const potStructure = useQuery(api.hands.getPotStructure, { handId: hand._id });
+
+  // Per-pot picked winners, indexed by potIndex.
+  const [pickedByPot, setPickedByPot] = useState<
+    Record<number, Set<Id<"seats">>>
+  >({});
+  const [step, setStep] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const folded = useMemo(() => {
-    const set = new Set<Id<"seats">>();
-    for (const a of actions) {
-      if (!a.undone && a.type === "fold") set.add(a.seatId);
-    }
-    return set;
-  }, [actions]);
+  if (!potStructure) {
+    return (
+      <View style={styles.dock}>
+        <Text style={styles.dockMuted}>Loading pots…</Text>
+      </View>
+    );
+  }
 
-  const eligible = seats.filter(
-    (s) => s.status === "active" && !folded.has(s._id),
-  );
+  const pots = potStructure.pots;
+  const currentPot = pots[step];
+  const isLast = step === pots.length - 1;
 
-  function toggle(seatId: Id<"seats">) {
-    setPicked((cur) => {
-      const next = new Set(cur);
-      if (next.has(seatId)) next.delete(seatId);
-      else next.add(seatId);
+  function toggle(potIndex: number, seatId: Id<"seats">) {
+    setPickedByPot((cur) => {
+      const next = { ...cur };
+      const set = new Set(next[potIndex] ?? []);
+      if (set.has(seatId)) set.delete(seatId);
+      else set.add(seatId);
+      next[potIndex] = set;
       return next;
     });
   }
 
-  async function confirm() {
-    if (picked.size === 0) return;
+  function advance() {
+    if (!isLast) {
+      setStep((s) => s + 1);
+      return;
+    }
+    submit();
+  }
+
+  async function submit() {
     setError(null);
     setBusy(true);
     try {
-      // Even split (MVP — side pots come in Phase 2a).
-      const winners = Array.from(picked);
-      const base = Math.floor(hand.pot / winners.length);
-      const remainder = hand.pot - base * winners.length;
-      const awards = winners.map((seatId, i) => ({
-        seatId,
-        potIndex: 0,
-        amount: i < remainder ? base + 1 : base,
-      }));
+      const awards: { seatId: Id<"seats">; potIndex: number; amount: number }[] = [];
+      for (const pot of pots) {
+        const winners = Array.from(pickedByPot[pot.index] ?? []);
+        if (winners.length === 0) {
+          throw new Error(`Pot ${pot.index + 1} needs a winner`);
+        }
+        const base = Math.floor(pot.amount / winners.length);
+        const remainder = pot.amount - base * winners.length;
+        winners.forEach((seatId, i) => {
+          awards.push({
+            seatId,
+            potIndex: pot.index,
+            amount: i < remainder ? base + 1 : base,
+          });
+        });
+      }
       await awardPot({ deviceId, handId: hand._id, awards });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Award failed");
@@ -633,16 +652,37 @@ function ShowdownDock({
     }
   }
 
+  if (!currentPot) {
+    return (
+      <View style={styles.dock}>
+        <Text style={styles.dockMuted}>No pot to award.</Text>
+      </View>
+    );
+  }
+
+  const eligible = currentPot.eligibleSeatIds
+    .map((id) => seats.find((s) => s._id === id))
+    .filter((s): s is SeatWithProfile => !!s);
+  const picked = pickedByPot[currentPot.index] ?? new Set<Id<"seats">>();
+  const potLabel =
+    pots.length === 1
+      ? "Who won?"
+      : currentPot.isMain
+      ? `Main pot (${step + 1}/${pots.length})`
+      : `Side pot ${step + 1}/${pots.length}`;
+
   return (
     <View style={styles.dock}>
-      <Text style={styles.dockHeader}>Who won? · pot {hand.pot}</Text>
+      <Text style={styles.dockHeader}>
+        {potLabel} · {currentPot.amount} chips
+      </Text>
       <View style={styles.showdownRow}>
         {eligible.map((seat) => {
           const isPicked = picked.has(seat._id);
           return (
             <Pressable
               key={seat._id}
-              onPress={() => toggle(seat._id)}
+              onPress={() => toggle(currentPot.index, seat._id)}
               style={[
                 styles.showdownPill,
                 {
@@ -665,7 +705,7 @@ function ShowdownDock({
       </View>
       {error ? <Text style={styles.error}>{error}</Text> : null}
       <Pressable
-        onPress={confirm}
+        onPress={advance}
         disabled={picked.size === 0 || busy}
         style={[
           styles.cta,
@@ -674,7 +714,11 @@ function ShowdownDock({
         ]}
       >
         <Text style={styles.ctaText}>
-          {picked.size > 1 ? `Split between ${picked.size}` : "Award pot"}
+          {isLast
+            ? picked.size > 1
+              ? `Split & award all`
+              : "Award all"
+            : "Next pot"}
         </Text>
       </Pressable>
     </View>
