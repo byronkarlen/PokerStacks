@@ -249,3 +249,28 @@ export const buyInSeat = mutation({
     return { seatId: seat._id, code: table.code };
   },
 });
+
+// Host-only: transition the table from lobby to active. Only allowed when at
+// least two seats are active (bought in). The actual first hand is dealt by
+// startHand once the table is active.
+export const startGame = mutation({
+  args: { deviceId: v.string(), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await requireHost(ctx, args.tableId, args.deviceId);
+    if (table.status !== "lobby") {
+      throw new Error("Game already started");
+    }
+
+    const seats = await ctx.db
+      .query("seats")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+    const activeCount = seats.filter((s) => s.status === "active").length;
+    if (activeCount < 2) {
+      throw new Error("Need at least 2 players bought in");
+    }
+
+    await ctx.db.patch(args.tableId, { status: "active" });
+    return null;
+  },
+});
