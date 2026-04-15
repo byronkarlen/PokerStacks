@@ -115,7 +115,6 @@ Host is the device that created the table. Host role is transferable: the curren
 - Reactions / quick chat
 - Identity upgrade (passkey/email) → cross-session stats
 - Venmo / Cash App / PayPal deep links from settlement
-- Web companion (spectator/table view)
 
 ---
 
@@ -530,15 +529,9 @@ This is a friends app, not a casino. Threat model: "Alice misclicks" and "the ho
 
 ---
 
-## 17. Web Compatibility Considerations
+## 17. Platform Targets
 
-Web is not an MVP deliverable but MVP code should not actively prevent it:
-- Keep native-only APIs (`expo-secure-store`, `expo-haptics`, `expo-keep-awake`) behind thin wrappers that no-op or fallback on web.
-- For `expo-secure-store` specifically: use `localStorage` fallback on web so `deviceId` still persists.
-- Prefer `react-native` primitives and `expo-image` over platform-specific components.
-- Don't install MVP features that block web build (`expo start --web` should produce a running app, even if some flows are rough).
-
-We will not test web flows during MVP. We will not regress them either.
+iOS and Android only. Web is not a target, in MVP or beyond. Native-only Expo APIs (`expo-secure-store`, `expo-haptics`, `expo-keep-awake`, etc.) are used directly without web shims.
 
 ---
 
@@ -585,7 +578,6 @@ We will not test web flows during MVP. We will not regress them either.
 - Identity upgrade (passkey/email)
 - Cross-session stats
 - Payment app deep links
-- Web companion
 
 ---
 
@@ -599,7 +591,8 @@ Things PokerStacks will **not** do, to keep scope honest:
 - **Real-money transactions.** App tracks chip counts and suggests payments; actual money moves through Venmo/cash/etc. off-app.
 - **Moderation / fair play enforcement.** Trust lives at the table.
 - **Cross-table stats or leaderboards (MVP).** Deferred to V2 after identity upgrade.
-- **Spectator mode (MVP).** Anyone at the table has a seat. Defer spectator view to V2 web.
+- **Spectator mode.** Anyone at the table has a seat.
+- **Web.** iOS/Android only — no web build, ever.
 
 ---
 
@@ -612,6 +605,6 @@ Resolved during design discussion:
 - **Currency:** chips only. 1 chip = 1 betting unit. Default 200 chips, 1 SB, 2 BB; configurable later but schema carries these fields from day one.
 - **Host powers:** buy in / rebuy any seat, kick, force-end, undo, edit stacks, edit settings, transfer host. Host is the banker — every stack increase goes through them. All other actions (own bets, cash out, sit out) are self-service.
 - **History:** store everything (every action, transaction, stack edit, host event) forever. Never store card data.
-- **Web:** not MVP; write MVP code to stay web-compatible.
+- **Web:** never. iOS/Android only.
 
 No further open questions blocking Phase 0.

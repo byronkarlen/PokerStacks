@@ -1,4 +1,4 @@
-// Native (iOS/Android) implementation. Web has its own override at storage.web.ts.
+// iOS/Android only — this app does not target web.
 import * as SecureStore from "expo-secure-store";
 
 export async function getItem(key: string): Promise<string | null> {

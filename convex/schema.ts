@@ -45,7 +45,8 @@ export default defineSchema({
   })
     .index("by_table", ["tableId"])
     .index("by_table_and_device", ["tableId", "deviceId"])
-    .index("by_table_and_seat", ["tableId", "seatIndex"]),
+    .index("by_table_and_seat", ["tableId", "seatIndex"])
+    .index("by_device", ["deviceId"]),
 
   // Buy-ins, rebuys, and cash-outs. Append-only.
   transactions: defineTable({
