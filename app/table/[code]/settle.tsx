@@ -94,7 +94,7 @@ export default function Settle() {
 
         {sumNetMismatch !== 0 ? (
           <Text style={styles.warning}>
-            Heads up — nets don't sum to zero ({sumNetMismatch}). Check the
+            Heads up — nets don&apos;t sum to zero ({sumNetMismatch}). Check the
             history for stack edits or undone events.
           </Text>
         ) : null}

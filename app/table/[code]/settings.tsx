@@ -151,7 +151,7 @@ export default function Settings() {
             <Text style={styles.modalTitle}>End game?</Text>
             <Text style={styles.modalSubtitle}>
               Everyone is cashed out at their current stack and the
-              settlement screen opens. This can't be undone.
+              settlement screen opens. This can&apos;t be undone.
             </Text>
             {endError ? <Text style={styles.error}>{endError}</Text> : null}
             <View style={styles.modalActions}>
@@ -436,7 +436,7 @@ function ActionModal({
 
           {target.kind === "make_host" ? (
             <Text style={styles.modalSubtitle}>
-              You'll lose host privileges; they'll gain them.
+              You&apos;ll lose host privileges; they&apos;ll gain them.
             </Text>
           ) : null}
 
