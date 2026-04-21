@@ -1,10 +1,11 @@
 import { api } from "@/convex/_generated/api";
 import { Doc, Id } from "@/convex/_generated/dataModel";
-import { colorHex, theme } from "@/lib/colors";
+import { colorHex, colors } from "@/theme";
 import { useQuery } from "convex/react";
 import { Stack, useLocalSearchParams } from "expo-router";
 import { useState } from "react";
 import {
+  ActivityIndicator,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -31,9 +32,9 @@ export default function History() {
 
   if (!table || !seats || !history) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={[styles.container, styles.loading]}>
         <Stack.Screen options={{ headerShown: true, title: "History" }} />
-        <Text style={[styles.muted, { padding: 24 }]}>Loading…</Text>
+        <ActivityIndicator color={colors.text} />
       </SafeAreaView>
     );
   }
@@ -137,7 +138,7 @@ function HandCard({
                     <Text style={styles.muted}>{` ${a.amount}`}</Text>
                   ) : null}
                   {a.undone ? (
-                    <Text style={[styles.muted, { color: theme.warning }]}>
+                    <Text style={[styles.muted, { color: colors.gold }]}>
                       {"  (undone)"}
                     </Text>
                   ) : null}
@@ -152,12 +153,13 @@ function HandCard({
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: theme.bg },
+  container: { flex: 1, backgroundColor: colors.bg },
+  loading: { justifyContent: "center", alignItems: "center" },
   scroll: { padding: 16, paddingBottom: 24 },
-  muted: { color: theme.textMuted, fontSize: 13 },
+  muted: { color: colors.mute, fontSize: 13 },
   card: {
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 12,
     marginTop: 8,
@@ -168,10 +170,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
     padding: 14,
   },
-  cardTitle: { color: theme.text, fontSize: 16, fontWeight: "700" },
-  expand: { color: theme.textMuted, fontSize: 18, marginLeft: 8 },
+  cardTitle: { color: colors.text, fontSize: 16, fontWeight: "700" },
+  expand: { color: colors.mute, fontSize: 18, marginLeft: 8 },
   cardBody: {
-    borderTopColor: theme.border,
+    borderTopColor: colors.hair,
     borderTopWidth: 1,
     padding: 12,
     gap: 6,
@@ -183,7 +185,7 @@ const styles = StyleSheet.create({
   },
   actionRowUndone: { opacity: 0.5 },
   colorDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
-  actionLine: { color: theme.text, fontSize: 13, flex: 1 },
-  actionName: { color: theme.text, fontWeight: "600" },
-  actionType: { color: theme.text, fontWeight: "600", textTransform: "uppercase" },
+  actionLine: { color: colors.text, fontSize: 13, flex: 1 },
+  actionName: { color: colors.text, fontWeight: "600" },
+  actionType: { color: colors.text, fontWeight: "600", textTransform: "uppercase" },
 });

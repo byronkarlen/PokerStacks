@@ -1,8 +1,11 @@
 import { api } from "@/convex/_generated/api";
-import { colorHex, theme } from "@/lib/colors";
-import { useQuery } from "convex/react";
+import { useUserId } from "@/hooks/useUserId";
+import { colorHex, colors } from "@/theme";
+import { useMutation, useQuery } from "convex/react";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
+import { useState } from "react";
 import {
+  ActivityIndicator,
   Pressable,
   ScrollView,
   Share,
@@ -16,18 +19,21 @@ export default function Settle() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
   const code = (codeParam ?? "").toUpperCase();
+  const userId = useUserId();
 
   const table = useQuery(api.tables.getByCode, { code });
   const settlement = useQuery(
     api.tables.getSettlement,
     table ? { tableId: table._id } : "skip",
   );
+  const deleteTable = useMutation(api.tables.deleteTable);
+  const [finishing, setFinishing] = useState(false);
 
   if (!table || !settlement) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={[styles.container, styles.loading]}>
         <Stack.Screen options={{ headerShown: true, title: "Settlement" }} />
-        <Text style={[styles.muted, { padding: 24 }]}>Loading…</Text>
+        <ActivityIndicator color={colors.text} />
       </SafeAreaView>
     );
   }
@@ -80,10 +86,10 @@ export default function Settle() {
                 {
                   color:
                     row.net > 0
-                      ? theme.accent
+                      ? colors.gold
                       : row.net < 0
-                      ? theme.danger
-                      : theme.textMuted,
+                      ? colors.danger
+                      : colors.mute,
                 },
               ]}
             >
@@ -123,10 +129,34 @@ export default function Settle() {
           <Text style={styles.ctaText}>Share summary</Text>
         </Pressable>
         <Pressable
-          onPress={() => router.replace("/")}
-          style={[styles.cta, styles.ctaSecondary]}
+          onPress={async () => {
+            if (finishing) return;
+            setFinishing(true);
+            const isHost =
+              !!userId && !!table && table.hostUserId === userId;
+            if (isHost && table) {
+              // Host finalizes the game — wipe every row referencing this
+              // table so the DB stays clean. Non-hosts just navigate away; the
+              // host's delete will retroactively clear it from their queries too.
+              try {
+                await deleteTable({ userId: userId!, tableId: table._id });
+              } catch {
+                // If delete fails, we still want the user home — they can
+                // tap Done again to retry.
+              }
+            }
+            router.replace("/");
+          }}
+          disabled={finishing}
+          style={[
+            styles.cta,
+            styles.ctaSecondary,
+            finishing && { opacity: 0.4 },
+          ]}
         >
-          <Text style={[styles.ctaText, { color: theme.text }]}>Done</Text>
+          <Text style={[styles.ctaText, { color: colors.text }]}>
+            {finishing ? "Finishing…" : "Done"}
+          </Text>
         </Pressable>
       </View>
     </SafeAreaView>
@@ -134,13 +164,14 @@ export default function Settle() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: theme.bg },
+  container: { flex: 1, backgroundColor: colors.bg },
+  loading: { justifyContent: "center", alignItems: "center" },
   scroll: { padding: 16, paddingBottom: 24 },
   header: { alignItems: "center", marginTop: 8, marginBottom: 24 },
-  code: { color: theme.textMuted, fontSize: 14, letterSpacing: 4 },
-  title: { color: theme.text, fontSize: 28, fontWeight: "800", marginTop: 4 },
+  code: { color: colors.mute, fontSize: 14, letterSpacing: 4 },
+  title: { color: colors.text, fontSize: 28, fontWeight: "800", marginTop: 4 },
   sectionLabel: {
-    color: theme.textMuted,
+    color: colors.mute,
     fontSize: 12,
     textTransform: "uppercase",
     letterSpacing: 1.5,
@@ -149,25 +180,25 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 12,
     padding: 14,
     marginTop: 8,
   },
   colorDot: { width: 24, height: 24, borderRadius: 12 },
-  name: { color: theme.text, fontSize: 16, fontWeight: "600" },
-  muted: { color: theme.textMuted, fontSize: 13, marginTop: 2 },
+  name: { color: colors.text, fontSize: 16, fontWeight: "600" },
+  muted: { color: colors.mute, fontSize: 13, marginTop: 2 },
   net: {
     fontSize: 24,
     fontWeight: "800",
     fontVariant: ["tabular-nums"],
   },
   warning: {
-    color: theme.warning,
-    backgroundColor: theme.surface,
-    borderColor: theme.warning,
+    color: colors.gold,
+    backgroundColor: colors.surface,
+    borderColor: colors.gold,
     borderWidth: 1,
     borderRadius: 8,
     padding: 12,
@@ -178,17 +209,17 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 12,
     padding: 14,
     marginTop: 8,
   },
-  transferText: { color: theme.text, fontSize: 16 },
-  transferName: { color: theme.text, fontWeight: "700" },
+  transferText: { color: colors.text, fontSize: 16 },
+  transferName: { color: colors.text, fontWeight: "700" },
   transferAmount: {
-    color: theme.text,
+    color: colors.text,
     fontSize: 22,
     fontWeight: "800",
     fontVariant: ["tabular-nums"],
@@ -196,20 +227,20 @@ const styles = StyleSheet.create({
   footer: {
     padding: 16,
     paddingTop: 12,
-    borderTopColor: theme.border,
+    borderTopColor: colors.hair,
     borderTopWidth: 1,
     gap: 8,
   },
   cta: {
-    backgroundColor: theme.accent,
+    backgroundColor: colors.gold,
     paddingVertical: 16,
     borderRadius: 12,
     alignItems: "center",
   },
   ctaSecondary: {
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
   },
-  ctaText: { color: theme.bg, fontSize: 17, fontWeight: "700" },
+  ctaText: { color: colors.bg, fontSize: 17, fontWeight: "700" },
 });

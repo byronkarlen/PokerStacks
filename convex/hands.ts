@@ -269,27 +269,6 @@ export const getHandHistory = query({
   },
 });
 
-/**
- * Combined audit timeline of host events and stack edits. Newest first.
- */
-export const getAuditLog = query({
-  args: { tableId: v.id("tables"), limit: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    const limit = args.limit ?? 100;
-    const hostEvents = await ctx.db
-      .query("hostEvents")
-      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
-      .order("desc")
-      .take(limit);
-    const stackEdits = await ctx.db
-      .query("stackEdits")
-      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
-      .order("desc")
-      .take(limit);
-    return { hostEvents, stackEdits };
-  },
-});
-
 // Lightweight bundle for the active hand UI: hand + all live actions + result.
 export const getHandView = query({
   args: { tableId: v.id("tables") },
@@ -315,11 +294,11 @@ export const getHandView = query({
 // =============================================================================
 
 export const startHand = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
     const table = await ctx.db.get(args.tableId);
     if (!table) throw new Error("Table not found");
-    if (table.hostDeviceId !== args.deviceId) throw new Error("Host only");
+    if (table.hostUserId !== args.userId) throw new Error("Host only");
     if (table.status === "ended") throw new Error("Game has ended");
 
     // The previous hand must be complete or voided before a new one starts.
@@ -374,7 +353,6 @@ export const startHand = mutation({
       .take(1);
     const handNumber = (recent[0]?.handNumber ?? 0) + 1;
 
-    const now = Date.now();
     const handId = await ctx.db.insert("hands", {
       tableId: table._id,
       handNumber,
@@ -384,7 +362,6 @@ export const startHand = mutation({
       currentBet: 0,
       minRaise: table.bigBlind,
       toActSeatIndex: firstToAct.seatIndex,
-      startedAt: now,
       voided: false,
     });
 
@@ -402,7 +379,6 @@ export const startHand = mutation({
       type: "post_sb",
       amount: sbAmount,
       sequence: sequence++,
-      createdAt: now,
       undone: false,
     });
     await ctx.db.patch(sbSeat._id, { chipStack: sbSeat.chipStack - sbAmount });
@@ -416,7 +392,6 @@ export const startHand = mutation({
       type: "post_bb",
       amount: bbAmount,
       sequence: sequence++,
-      createdAt: now,
       undone: false,
     });
     await ctx.db.patch(bbSeat._id, { chipStack: bbSeat.chipStack - bbAmount });
@@ -442,7 +417,7 @@ export const startHand = mutation({
 
 export const recordAction = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     handId: v.id("hands"),
     type: v.union(
       v.literal("check"),
@@ -471,8 +446,8 @@ export const recordAction = mutation({
     // Resolve caller's seat at this table.
     const seat = await ctx.db
       .query("seats")
-      .withIndex("by_table_and_device", (q) =>
-        q.eq("tableId", hand.tableId).eq("deviceId", args.deviceId),
+      .withIndex("by_table_and_user", (q) =>
+        q.eq("tableId", hand.tableId).eq("userId", args.userId),
       )
       .unique();
     if (!seat) throw new Error("Not seated at this table");
@@ -582,7 +557,6 @@ export const recordAction = mutation({
       type: actionType,
       amount: chipDelta,
       sequence: state.lastSequence + 1,
-      createdAt: now,
       undone: false,
     });
 
@@ -617,7 +591,6 @@ export const recordAction = mutation({
         handId: hand._id,
         tableId: hand.tableId,
         awards: [{ seatId: winner._id, potIndex: 0, amount: newPot }],
-        createdAt: now,
         voided: false,
       });
       const winnerDoc = await ctx.db.get(winner._id);
@@ -699,7 +672,7 @@ export const recordAction = mutation({
 
 export const awardPot = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     handId: v.id("hands"),
     awards: v.array(
       v.object({
@@ -732,8 +705,8 @@ export const awardPot = mutation({
     // first one wins per the plan).
     const callerSeat = await ctx.db
       .query("seats")
-      .withIndex("by_table_and_device", (q) =>
-        q.eq("tableId", hand.tableId).eq("deviceId", args.deviceId),
+      .withIndex("by_table_and_user", (q) =>
+        q.eq("tableId", hand.tableId).eq("userId", args.userId),
       )
       .unique();
     if (!callerSeat) throw new Error("Not seated at this table");
@@ -751,7 +724,6 @@ export const awardPot = mutation({
       handId: hand._id,
       tableId: hand.tableId,
       awards: args.awards,
-      createdAt: now,
       voided: false,
     });
 
@@ -780,11 +752,11 @@ export const awardPot = mutation({
 // =============================================================================
 
 export const undoLastAction = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
     const table = await ctx.db.get(args.tableId);
     if (!table) throw new Error("Table not found");
-    if (table.hostDeviceId !== args.deviceId) throw new Error("Host only");
+    if (table.hostUserId !== args.userId) throw new Error("Host only");
 
     // Find the most recent hand at this table.
     const recent = await ctx.db
@@ -819,13 +791,6 @@ export const undoLastAction = mutation({
           completedAt: undefined,
         });
         await ctx.db.patch(table._id, { currentHandId: hand._id });
-        await ctx.db.insert("hostEvents", {
-          tableId: table._id,
-          byDeviceId: args.deviceId,
-          type: "undo_pot_award",
-          payload: { handId: hand._id },
-          createdAt: now,
-        });
         return { kind: "pot_award" as const };
       }
     }
@@ -849,7 +814,7 @@ export const undoLastAction = mutation({
     await ctx.db.patch(last._id, {
       undone: true,
       undoneAt: now,
-      undoneByDeviceId: args.deviceId,
+      undoneByUserId: args.userId,
     });
     if (last.amount > 0) {
       const seat = await ctx.db.get(last.seatId);
@@ -899,19 +864,6 @@ export const undoLastAction = mutation({
     });
     await ctx.db.patch(table._id, { currentHandId: hand._id });
 
-    await ctx.db.insert("hostEvents", {
-      tableId: table._id,
-      byDeviceId: args.deviceId,
-      type: "undo_action",
-      payload: {
-        handId: hand._id,
-        actionId: last._id,
-        actionType: last.type,
-        amount: last.amount,
-      },
-      createdAt: now,
-    });
-
     return { kind: "action" as const };
   },
 });
@@ -921,11 +873,11 @@ export const undoLastAction = mutation({
 // =============================================================================
 
 export const voidHand = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
     const table = await ctx.db.get(args.tableId);
     if (!table) throw new Error("Table not found");
-    if (table.hostDeviceId !== args.deviceId) throw new Error("Host only");
+    if (table.hostUserId !== args.userId) throw new Error("Host only");
     if (!table.currentHandId) throw new Error("No active hand");
 
     const hand = await ctx.db.get(table.currentHandId);
@@ -975,14 +927,6 @@ export const voidHand = mutation({
       toActSeatIndex: undefined,
     });
     await ctx.db.patch(table._id, { currentHandId: undefined });
-
-    await ctx.db.insert("hostEvents", {
-      tableId: table._id,
-      byDeviceId: args.deviceId,
-      type: "void_hand",
-      payload: { handId: hand._id },
-      createdAt: now,
-    });
 
     return null;
   },

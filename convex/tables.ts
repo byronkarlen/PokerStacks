@@ -1,9 +1,12 @@
 import { v } from "convex/values";
 import { Id } from "./_generated/dataModel";
 import { mutation, MutationCtx, query, QueryCtx } from "./_generated/server";
+import { pickRandomColor, pickRandomColorExcluding } from "./palette";
 
-// Unambiguous alphabet — avoids 0/O, 1/I/L confusion at the table.
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+// Letters-only — avoids 0/O, 1/I/L confusion AND keeps all glyphs at cap
+// height (Georgia italic's digits use old-style figures which drop below
+// the baseline). 23^4 ≈ 280k combinations, plenty for collision-free codes.
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ";
 
 function randomCode(): string {
   let s = "";
@@ -20,15 +23,15 @@ async function findTableByCode(ctx: QueryCtx | MutationCtx, code: string) {
     .unique();
 }
 
-async function requireSeatForDevice(
+async function requireSeatForUser(
   ctx: QueryCtx | MutationCtx,
   tableId: Id<"tables">,
-  deviceId: string,
+  userId: Id<"users">,
 ) {
   const seat = await ctx.db
     .query("seats")
-    .withIndex("by_table_and_device", (q) =>
-      q.eq("tableId", tableId).eq("deviceId", deviceId),
+    .withIndex("by_table_and_user", (q) =>
+      q.eq("tableId", tableId).eq("userId", userId),
     )
     .unique();
   if (!seat) throw new Error("Not seated at this table");
@@ -38,29 +41,29 @@ async function requireSeatForDevice(
 async function requireHost(
   ctx: MutationCtx,
   tableId: Id<"tables">,
-  deviceId: string,
+  userId: Id<"users">,
 ) {
   const table = await ctx.db.get(tableId);
   if (!table) throw new Error("Table not found");
-  if (table.hostDeviceId !== deviceId) throw new Error("Host only");
+  if (table.hostUserId !== userId) throw new Error("Host only");
   return table;
 }
 
 /**
- * Returns the table the device is currently seated at, if any.
+ * Returns the table the user is currently seated at, if any.
  * Used on app open to deep-link the user back into their game.
  *
- * "Currently seated" means: a seat exists for this device with status
+ * "Currently seated" means: a seat exists for this user with status
  * != cashed_out / kicked, AND the table is not ended.
  */
 export const getMyActiveTable = query({
-  args: { deviceId: v.string() },
+  args: { userId: v.id("users") },
   handler: async (ctx, args) => {
-    // Devices accumulate one seat per table they've ever joined; bounded scan
+    // Users accumulate one seat per table they've ever joined; bounded scan
     // ordered most-recent-first so the active one (if any) appears early.
     const seats = await ctx.db
       .query("seats")
-      .withIndex("by_device", (q) => q.eq("deviceId", args.deviceId))
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
       .order("desc")
       .take(50);
 
@@ -95,7 +98,8 @@ export const getSeats = query({
   },
 });
 
-// Returns each seat enriched with the device's current displayName + color.
+// Returns each seat enriched with the user's current displayName.
+// Color lives on the seat itself.
 export const getSeatsWithProfile = query({
   args: { tableId: v.id("tables") },
   handler: async (ctx, args) => {
@@ -107,14 +111,10 @@ export const getSeatsWithProfile = query({
 
     return await Promise.all(
       seats.map(async (seat) => {
-        const device = await ctx.db
-          .query("devices")
-          .withIndex("by_device", (q) => q.eq("deviceId", seat.deviceId))
-          .unique();
+        const user = await ctx.db.get(seat.userId);
         return {
           ...seat,
-          displayName: device?.displayName ?? "?",
-          color: device?.color ?? "blue",
+          displayName: user?.displayName ?? "?",
         };
       }),
     );
@@ -123,7 +123,7 @@ export const getSeatsWithProfile = query({
 
 export const createTable = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     defaultBuyIn: v.optional(v.number()),
     smallBlind: v.optional(v.number()),
     bigBlind: v.optional(v.number()),
@@ -137,26 +137,31 @@ export const createTable = mutation({
       code = randomCode();
     }
 
-    const now = Date.now();
+    const defaultBuyIn = args.defaultBuyIn ?? 100;
+    const smallBlind = args.smallBlind ?? 0.5;
+    const bigBlind = args.bigBlind ?? 1;
     const tableId = await ctx.db.insert("tables", {
       code,
-      hostDeviceId: args.deviceId,
+      hostUserId: args.userId,
       status: "lobby",
-      defaultBuyIn: args.defaultBuyIn ?? 200,
-      smallBlind: args.smallBlind ?? 1,
-      bigBlind: args.bigBlind ?? 2,
+      defaultBuyIn,
+      smallBlind,
+      bigBlind,
+      // -1 signals "no explicit dealer chosen yet"; hands.ts interprets this
+      // as hand #1 → ring[0] (the host). UI displays the Button on seat 0
+      // in this state. If the host picks a dealer via setInitialDealer, the
+      // value becomes a real index and hands.ts rotates from it.
       dealerSeatIndex: -1,
-      createdAt: now,
     });
 
-    // Host always occupies seat 0, awaiting their own buy-in.
+    // MVP: everyone starts with the fixed default stack — no pending buy-in.
     await ctx.db.insert("seats", {
       tableId,
-      deviceId: args.deviceId,
+      userId: args.userId,
       seatIndex: 0,
-      chipStack: 0,
-      status: "pending_buy_in",
-      joinedAt: now,
+      chipStack: defaultBuyIn,
+      color: pickRandomColor(),
+      status: "active",
     });
 
     return { tableId, code };
@@ -165,7 +170,7 @@ export const createTable = mutation({
 
 export const joinTable = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     code: v.string(),
   },
   handler: async (ctx, args) => {
@@ -177,8 +182,8 @@ export const joinTable = mutation({
     // Already seated? Idempotent — return existing seat.
     const existing = await ctx.db
       .query("seats")
-      .withIndex("by_table_and_device", (q) =>
-        q.eq("tableId", table._id).eq("deviceId", args.deviceId),
+      .withIndex("by_table_and_user", (q) =>
+        q.eq("tableId", table._id).eq("userId", args.userId),
       )
       .unique();
     if (existing) {
@@ -193,13 +198,16 @@ export const joinTable = mutation({
     const nextIndex =
       seats.length === 0 ? 0 : Math.max(...seats.map((s) => s.seatIndex)) + 1;
 
+    const usedColors = new Set(seats.map((s) => s.color));
+
+    // MVP: new joiners start with the table's default stack, immediately active.
     const seatId = await ctx.db.insert("seats", {
       tableId: table._id,
-      deviceId: args.deviceId,
+      userId: args.userId,
       seatIndex: nextIndex,
-      chipStack: 0,
-      status: "pending_buy_in",
-      joinedAt: Date.now(),
+      chipStack: table.defaultBuyIn,
+      color: pickRandomColorExcluding(usedColors),
+      status: "active",
     });
 
     return { tableId: table._id, code: table.code, seatId };
@@ -209,7 +217,7 @@ export const joinTable = mutation({
 // Host-only: bring a seat from pending_buy_in to active with the given chips.
 export const buyInSeat = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     seatId: v.id("seats"),
     amount: v.number(),
   },
@@ -219,7 +227,7 @@ export const buyInSeat = mutation({
     const seat = await ctx.db.get(args.seatId);
     if (!seat) throw new Error("Seat not found");
 
-    const table = await requireHost(ctx, seat.tableId, args.deviceId);
+    const table = await requireHost(ctx, seat.tableId, args.userId);
 
     if (seat.status !== "pending_buy_in") {
       throw new Error("Seat is not awaiting a buy-in");
@@ -235,15 +243,6 @@ export const buyInSeat = mutation({
       seatId: seat._id,
       type: "buy_in",
       amount: args.amount,
-      createdAt: Date.now(),
-    });
-
-    await ctx.db.insert("hostEvents", {
-      tableId: seat.tableId,
-      byDeviceId: args.deviceId,
-      type: "buy_in",
-      payload: { seatId: seat._id, amount: args.amount },
-      createdAt: Date.now(),
     });
 
     return { seatId: seat._id, code: table.code };
@@ -254,9 +253,9 @@ export const buyInSeat = mutation({
 // least two seats are active (bought in). The actual first hand is dealt by
 // startHand once the table is active.
 export const startGame = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
-    const table = await requireHost(ctx, args.tableId, args.deviceId);
+    const table = await requireHost(ctx, args.tableId, args.userId);
     if (table.status !== "lobby") {
       throw new Error("Game already started");
     }
@@ -278,7 +277,7 @@ export const startGame = mutation({
 // Host-only: add chips to an active seat. Allowed only between hands per §6.5.
 export const rebuySeat = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     seatId: v.id("seats"),
     amount: v.number(),
   },
@@ -288,7 +287,7 @@ export const rebuySeat = mutation({
     const seat = await ctx.db.get(args.seatId);
     if (!seat) throw new Error("Seat not found");
 
-    const table = await requireHost(ctx, seat.tableId, args.deviceId);
+    const table = await requireHost(ctx, seat.tableId, args.userId);
 
     if (table.currentHandId) {
       throw new Error("Cannot rebuy mid-hand — wait until the next hand");
@@ -300,20 +299,11 @@ export const rebuySeat = mutation({
 
     await ctx.db.patch(seat._id, { chipStack: seat.chipStack + args.amount });
 
-    const now = Date.now();
     await ctx.db.insert("transactions", {
       tableId: seat.tableId,
       seatId: seat._id,
       type: "rebuy",
       amount: args.amount,
-      createdAt: now,
-    });
-    await ctx.db.insert("hostEvents", {
-      tableId: seat.tableId,
-      byDeviceId: args.deviceId,
-      type: "rebuy",
-      payload: { seatId: seat._id, amount: args.amount },
-      createdAt: now,
     });
 
     return null;
@@ -324,14 +314,14 @@ export const rebuySeat = mutation({
 // as an implicit cash-out for settlement. Mid-hand kicks leave already-
 // committed chips in the pot (effectively a fold).
 export const kickPlayer = mutation({
-  args: { deviceId: v.string(), seatId: v.id("seats") },
+  args: { userId: v.id("users"), seatId: v.id("seats") },
   handler: async (ctx, args) => {
     const seat = await ctx.db.get(args.seatId);
     if (!seat) throw new Error("Seat not found");
 
-    const table = await requireHost(ctx, seat.tableId, args.deviceId);
+    const table = await requireHost(ctx, seat.tableId, args.userId);
 
-    if (seat.deviceId === table.hostDeviceId) {
+    if (seat.userId === table.hostUserId) {
       throw new Error("Host cannot kick themselves — transfer host first");
     }
 
@@ -339,7 +329,6 @@ export const kickPlayer = mutation({
       throw new Error("Seat already removed");
     }
 
-    const now = Date.now();
     const remainingChips = seat.chipStack;
 
     await ctx.db.patch(seat._id, { status: "kicked", chipStack: 0 });
@@ -350,64 +339,29 @@ export const kickPlayer = mutation({
         seatId: seat._id,
         type: "cash_out",
         amount: remainingChips,
-        createdAt: now,
       });
     }
-
-    await ctx.db.insert("hostEvents", {
-      tableId: seat.tableId,
-      byDeviceId: args.deviceId,
-      type: "kick",
-      payload: { seatId: seat._id, remainingChips },
-      createdAt: now,
-    });
 
     return null;
   },
 });
 
-// Host-only: manually adjust a seat's chip stack with a logged reason.
+// Host-only: manually adjust a seat's chip stack.
 export const editStack = mutation({
   args: {
-    deviceId: v.string(),
+    userId: v.id("users"),
     seatId: v.id("seats"),
     newAmount: v.number(),
-    reason: v.string(),
   },
   handler: async (ctx, args) => {
     if (args.newAmount < 0) throw new Error("Amount cannot be negative");
-    if (args.reason.trim().length === 0) throw new Error("Reason required");
 
     const seat = await ctx.db.get(args.seatId);
     if (!seat) throw new Error("Seat not found");
 
-    await requireHost(ctx, seat.tableId, args.deviceId);
+    await requireHost(ctx, seat.tableId, args.userId);
 
-    const before = seat.chipStack;
     await ctx.db.patch(seat._id, { chipStack: args.newAmount });
-
-    const now = Date.now();
-    await ctx.db.insert("stackEdits", {
-      tableId: seat.tableId,
-      seatId: seat._id,
-      byDeviceId: args.deviceId,
-      before,
-      after: args.newAmount,
-      reason: args.reason.trim(),
-      createdAt: now,
-    });
-    await ctx.db.insert("hostEvents", {
-      tableId: seat.tableId,
-      byDeviceId: args.deviceId,
-      type: "edit_stack",
-      payload: {
-        seatId: seat._id,
-        before,
-        after: args.newAmount,
-        reason: args.reason.trim(),
-      },
-      createdAt: now,
-    });
 
     return null;
   },
@@ -415,28 +369,21 @@ export const editStack = mutation({
 
 // Host-only: transfer the host role to another active seat at the table.
 export const transferHost = mutation({
-  args: { deviceId: v.string(), toSeatId: v.id("seats") },
+  args: { userId: v.id("users"), toSeatId: v.id("seats") },
   handler: async (ctx, args) => {
     const target = await ctx.db.get(args.toSeatId);
     if (!target) throw new Error("Seat not found");
 
-    const table = await requireHost(ctx, target.tableId, args.deviceId);
+    const table = await requireHost(ctx, target.tableId, args.userId);
 
-    if (target.deviceId === table.hostDeviceId) {
+    if (target.userId === table.hostUserId) {
       throw new Error("Already the host");
     }
     if (target.status !== "active" && target.status !== "sitting_out") {
       throw new Error("Target seat is not playable");
     }
 
-    await ctx.db.patch(table._id, { hostDeviceId: target.deviceId });
-    await ctx.db.insert("hostEvents", {
-      tableId: table._id,
-      byDeviceId: args.deviceId,
-      type: "transfer_host",
-      payload: { toSeatId: target._id, toDeviceId: target.deviceId },
-      createdAt: Date.now(),
-    });
+    await ctx.db.patch(table._id, { hostUserId: target.userId });
 
     return null;
   },
@@ -457,9 +404,9 @@ async function requireBetweenHands(
 }
 
 export const sitOut = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
-    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    const seat = await requireSeatForUser(ctx, args.tableId, args.userId);
     if (seat.status !== "active") {
       throw new Error("Only an active seat can sit out");
     }
@@ -470,9 +417,9 @@ export const sitOut = mutation({
 });
 
 export const sitIn = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
-    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    const seat = await requireSeatForUser(ctx, args.tableId, args.userId);
     if (seat.status !== "sitting_out") {
       throw new Error("Seat is not sitting out");
     }
@@ -483,9 +430,9 @@ export const sitIn = mutation({
 });
 
 export const cashOut = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
-    const seat = await requireSeatForDevice(ctx, args.tableId, args.deviceId);
+    const seat = await requireSeatForUser(ctx, args.tableId, args.userId);
     const table = await ctx.db.get(args.tableId);
     if (!table) throw new Error("Table not found");
 
@@ -494,7 +441,7 @@ export const cashOut = mutation({
     }
 
     // Host must transfer the role before cashing out so the table isn't orphaned.
-    if (table.hostDeviceId === args.deviceId) {
+    if (table.hostUserId === args.userId) {
       throw new Error("Transfer host before cashing out");
     }
 
@@ -509,7 +456,6 @@ export const cashOut = mutation({
         seatId: seat._id,
         type: "cash_out",
         amount: remaining,
-        createdAt: Date.now(),
       });
     }
 
@@ -522,10 +468,13 @@ export const cashOut = mutation({
 // =============================================================================
 
 export const endGame = mutation({
-  args: { deviceId: v.string(), tableId: v.id("tables") },
+  args: { userId: v.id("users"), tableId: v.id("tables") },
   handler: async (ctx, args) => {
-    const table = await requireHost(ctx, args.tableId, args.deviceId);
-    if (table.status === "ended") throw new Error("Already ended");
+    const table = await requireHost(ctx, args.tableId, args.userId);
+    // Idempotent — if a duplicate call lands (double-tap, race, re-opened
+    // settings after the game already ended), just no-op rather than
+    // surfacing a scary error.
+    if (table.status === "ended") return null;
 
     const now = Date.now();
 
@@ -587,22 +536,162 @@ export const endGame = mutation({
           seatId: seat._id,
           type: "cash_out",
           amount: remaining,
-          createdAt: now,
         });
       }
     }
 
     // 3. Mark the table ended.
-    await ctx.db.patch(table._id, { status: "ended", endedAt: now });
+    await ctx.db.patch(table._id, { status: "ended" });
 
-    await ctx.db.insert("hostEvents", {
-      tableId: table._id,
-      byDeviceId: args.deviceId,
-      type: "end_game",
-      payload: {},
-      createdAt: now,
-    });
+    return null;
+  },
+});
 
+// Host-only: pick which seat is the opening dealer. Lobby-only — once the
+// game starts, the dealer button rotates automatically per-hand.
+export const setInitialDealer = mutation({
+  args: {
+    userId: v.id("users"),
+    tableId: v.id("tables"),
+    seatId: v.id("seats"),
+  },
+  handler: async (ctx, args) => {
+    const table = await requireHost(ctx, args.tableId, args.userId);
+    if (table.status !== "lobby") {
+      throw new Error("Can only set the initial dealer in the lobby");
+    }
+    const seat = await ctx.db.get(args.seatId);
+    if (!seat || seat.tableId !== args.tableId) {
+      throw new Error("Seat not at this table");
+    }
+    await ctx.db.patch(args.tableId, { dealerSeatIndex: seat.seatIndex });
+    return null;
+  },
+});
+
+// Host-only: reassign seat order. Client sends the full list of seatIds in
+// the new order; server maps them to seatIndex 0..N-1. Dealer follows its
+// seat (dealerSeatIndex is updated to match the dealer seat's new index).
+// Lobby-only.
+export const reorderSeats = mutation({
+  args: {
+    userId: v.id("users"),
+    tableId: v.id("tables"),
+    seatIdsInOrder: v.array(v.id("seats")),
+  },
+  handler: async (ctx, args) => {
+    const table = await requireHost(ctx, args.tableId, args.userId);
+    if (table.status !== "lobby") {
+      throw new Error("Can only reorder seats in the lobby");
+    }
+
+    const seats = await ctx.db
+      .query("seats")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+
+    if (seats.length !== args.seatIdsInOrder.length) {
+      throw new Error("Seat list must include every seat");
+    }
+    const requested = new Set(args.seatIdsInOrder.map((id) => id.toString()));
+    for (const s of seats) {
+      if (!requested.has(s._id.toString())) {
+        throw new Error("Seat list must include every seat");
+      }
+    }
+
+    // Track the dealer's seatId so we can update dealerSeatIndex after moving.
+    const dealerSeat = seats.find(
+      (s) => s.seatIndex === table.dealerSeatIndex,
+    );
+
+    // Two passes to avoid transient collisions on seatIndex during the shuffle.
+    for (let i = 0; i < seats.length; i++) {
+      await ctx.db.patch(seats[i]._id, { seatIndex: -1000 - i });
+    }
+    for (let i = 0; i < args.seatIdsInOrder.length; i++) {
+      await ctx.db.patch(args.seatIdsInOrder[i], { seatIndex: i });
+    }
+
+    if (dealerSeat) {
+      const newIdx = args.seatIdsInOrder.findIndex(
+        (id) => id === dealerSeat._id,
+      );
+      if (newIdx >= 0) {
+        await ctx.db.patch(args.tableId, { dealerSeatIndex: newIdx });
+      }
+    }
+    return null;
+  },
+});
+
+// Host-only: hard-delete the table and every row that references it. Only
+// valid after endGame has been called (status === "ended") so we never wipe
+// data a settlement could still need. MVP-scoped — for long-term history you'd
+// want a soft-delete / archive flag instead.
+export const deleteTable = mutation({
+  args: { userId: v.id("users"), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await requireHost(ctx, args.tableId, args.userId);
+    if (table.status !== "ended") {
+      throw new Error("End the game before deleting");
+    }
+
+    // handResults is keyed by handId, so grab the table's hands first.
+    const hands = await ctx.db
+      .query("hands")
+      .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+      .collect();
+    for (const hand of hands) {
+      const results = await ctx.db
+        .query("handResults")
+        .withIndex("by_hand", (q) => q.eq("handId", hand._id))
+        .collect();
+      for (const r of results) await ctx.db.delete(r._id);
+      await ctx.db.delete(hand._id);
+    }
+
+    // All other child tables indexed by_table.
+    for (const indexName of [
+      "seats",
+      "actions",
+      "transactions",
+    ] as const) {
+      const rows = await ctx.db
+        .query(indexName)
+        .withIndex("by_table", (q) => q.eq("tableId", args.tableId))
+        .collect();
+      for (const row of rows) await ctx.db.delete(row._id);
+    }
+
+    await ctx.db.delete(args.tableId);
+    return null;
+  },
+});
+
+// Self-remove from a table during the lobby. Non-host only; during a game,
+// use cashOut instead. Hard-deletes the seat row since no chips have moved.
+export const leaveTable = mutation({
+  args: { userId: v.id("users"), tableId: v.id("tables") },
+  handler: async (ctx, args) => {
+    const table = await ctx.db.get(args.tableId);
+    if (!table) throw new Error("Table not found");
+    if (table.hostUserId === args.userId) {
+      throw new Error("Host can't leave — cancel the table instead");
+    }
+    if (table.status !== "lobby") {
+      throw new Error("Game already started — use cash out instead");
+    }
+
+    const seat = await ctx.db
+      .query("seats")
+      .withIndex("by_table_and_user", (q) =>
+        q.eq("tableId", args.tableId).eq("userId", args.userId),
+      )
+      .unique();
+    if (!seat) return null; // Idempotent — already gone.
+
+    await ctx.db.delete(seat._id);
     return null;
   },
 });
@@ -629,7 +718,7 @@ export const getSettlement = query({
     // Per-seat aggregates.
     type Row = {
       seatId: Id<"seats">;
-      deviceId: string;
+      userId: Id<"users">;
       displayName: string;
       color: string;
       buyIns: number; // includes initial + rebuys
@@ -648,15 +737,12 @@ export const getSettlement = query({
           const cashOuts = tx
             .filter((t) => t.type === "cash_out")
             .reduce((acc, t) => acc + t.amount, 0);
-          const device = await ctx.db
-            .query("devices")
-            .withIndex("by_device", (q) => q.eq("deviceId", seat.deviceId))
-            .unique();
+          const user = await ctx.db.get(seat.userId);
           return {
             seatId: seat._id,
-            deviceId: seat.deviceId,
-            displayName: device?.displayName ?? "?",
-            color: device?.color ?? "blue",
+            userId: seat.userId,
+            displayName: user?.displayName ?? "?",
+            color: seat.color,
             buyIns,
             cashOuts,
             net: cashOuts - buyIns,

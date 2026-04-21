@@ -1,11 +1,12 @@
 import { api } from "@/convex/_generated/api";
 import { Doc, Id } from "@/convex/_generated/dataModel";
-import { colorHex, theme } from "@/lib/colors";
-import { useDeviceId } from "@/lib/deviceId";
+import { useUserId } from "@/hooks/useUserId";
+import { colorHex, colors } from "@/theme";
 import { useMutation, useQuery } from "convex/react";
 import { Stack, useLocalSearchParams, useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
   Modal,
   Pressable,
   ScrollView,
@@ -23,7 +24,7 @@ export default function Settings() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
   const code = (codeParam ?? "").toUpperCase();
-  const deviceId = useDeviceId();
+  const userId = useUserId();
 
   const table = useQuery(api.tables.getByCode, { code });
   const seats = useQuery(
@@ -43,15 +44,26 @@ export default function Settings() {
   const [endError, setEndError] = useState<string | null>(null);
   const [endingBusy, setEndingBusy] = useState(false);
 
-  if (!table || !seats || !deviceId) {
+  // If the game ends while we're here (from another path, or our own endGame
+  // that already succeeded), bounce to settlement so the user isn't stranded
+  // on a stale settings view and can't fire endGame a second time.
+  useEffect(() => {
+    if (table?.status === "ended") {
+      router.replace(`/table/${code}/settle`);
+    } else if (table?.status === "lobby") {
+      router.replace(`/table/${code}/lobby`);
+    }
+  }, [table?.status, code, router]);
+
+  if (!table || !seats || !userId) {
     return (
-      <SafeAreaView style={styles.container}>
-        <Text style={styles.muted}>Loading…</Text>
+      <SafeAreaView style={[styles.container, styles.loading]}>
+        <ActivityIndicator color={colors.text} />
       </SafeAreaView>
     );
   }
 
-  const isHost = table.hostDeviceId === deviceId;
+  const isHost = table.hostUserId === userId;
   if (!isHost) {
     return (
       <SafeAreaView style={styles.container}>
@@ -64,7 +76,7 @@ export default function Settings() {
   async function handleVoid() {
     setVoidError(null);
     try {
-      await voidHand({ deviceId: deviceId!, tableId: table!._id });
+      await voidHand({ userId: userId!, tableId: table!._id });
     } catch (e) {
       setVoidError(e instanceof Error ? e.message : "Void failed");
     }
@@ -74,7 +86,7 @@ export default function Settings() {
     setEndError(null);
     setEndingBusy(true);
     try {
-      await endGame({ deviceId: deviceId!, tableId: table!._id });
+      await endGame({ userId: userId!, tableId: table!._id });
       router.replace(`/table/${code}/settle`);
     } catch (e) {
       setEndError(e instanceof Error ? e.message : "End-game failed");
@@ -127,7 +139,7 @@ export default function Settings() {
           <SeatCard
             key={seat._id}
             seat={seat}
-            isHostSeat={seat.deviceId === table.hostDeviceId}
+            isHostSeat={seat.userId === table.hostUserId}
             handInProgress={handInProgress}
             onAction={(kind) => setActionTarget({ seat, kind })}
           />
@@ -159,7 +171,7 @@ export default function Settings() {
                 onPress={() => setEndConfirmOpen(false)}
                 style={[styles.modalButton, styles.modalCancel]}
               >
-                <Text style={[styles.modalButtonText, { color: theme.text }]}>
+                <Text style={[styles.modalButtonText, { color: colors.text }]}>
                   Cancel
                 </Text>
               </Pressable>
@@ -168,7 +180,7 @@ export default function Settings() {
                 disabled={endingBusy}
                 style={[
                   styles.modalButton,
-                  { backgroundColor: theme.danger },
+                  { backgroundColor: colors.danger },
                   endingBusy && styles.seatBtnDisabled,
                 ]}
               >
@@ -266,11 +278,11 @@ function SeatBtn({
 }) {
   const bg =
     tone === "accent"
-      ? theme.accent
+      ? colors.gold
       : tone === "danger"
-      ? theme.danger
-      : theme.surfaceElevated;
-  const fg = tone ? theme.bg : theme.text;
+      ? colors.danger
+      : colors.raised;
+  const fg = tone ? colors.bg : colors.text;
   return (
     <Pressable
       onPress={onPress}
@@ -299,14 +311,13 @@ function ActionModal({
   defaultBuyIn: number;
   onClose: () => void;
 }) {
-  const deviceId = useDeviceId();
+  const userId = useUserId();
   const rebuySeat = useMutation(api.tables.rebuySeat);
   const editStack = useMutation(api.tables.editStack);
   const kickPlayer = useMutation(api.tables.kickPlayer);
   const transferHost = useMutation(api.tables.transferHost);
 
   const [amount, setAmount] = useState("");
-  const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -316,7 +327,7 @@ function ActionModal({
   // (We rely on remount via key on Modal child; easier: parent unmounts via null target.)
 
   async function go() {
-    if (!deviceId || !target) return;
+    if (!userId || !target) return;
     setBusy(true);
     setError(null);
     try {
@@ -325,7 +336,7 @@ function ActionModal({
           const n = Number(amount);
           if (!Number.isInteger(n) || n <= 0) throw new Error("Enter a positive whole number");
           await rebuySeat({
-            deviceId,
+            userId,
             seatId: target.seat._id as Id<"seats">,
             amount: n,
           });
@@ -334,25 +345,23 @@ function ActionModal({
         case "edit_stack": {
           const n = Number(amount);
           if (!Number.isInteger(n) || n < 0) throw new Error("Enter zero or a positive number");
-          if (reason.trim().length === 0) throw new Error("Reason required");
           await editStack({
-            deviceId,
+            userId,
             seatId: target.seat._id as Id<"seats">,
             newAmount: n,
-            reason: reason.trim(),
           });
           break;
         }
         case "kick": {
           await kickPlayer({
-            deviceId,
+            userId,
             seatId: target.seat._id as Id<"seats">,
           });
           break;
         }
         case "make_host": {
           await transferHost({
-            deviceId,
+            userId,
             toSeatId: target.seat._id as Id<"seats">,
           });
           break;
@@ -360,7 +369,6 @@ function ActionModal({
       }
       onClose();
       setAmount("");
-      setReason("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed");
     } finally {
@@ -396,7 +404,7 @@ function ActionModal({
                 value={amount}
                 onChangeText={setAmount}
                 placeholder={String(defaultBuyIn)}
-                placeholderTextColor={theme.textMuted}
+                placeholderTextColor={colors.mute}
                 keyboardType="number-pad"
                 style={styles.modalInput}
                 autoFocus
@@ -413,17 +421,10 @@ function ActionModal({
                 value={amount}
                 onChangeText={setAmount}
                 placeholder={String(target.seat.chipStack)}
-                placeholderTextColor={theme.textMuted}
+                placeholderTextColor={colors.mute}
                 keyboardType="number-pad"
                 style={styles.modalInput}
                 autoFocus
-              />
-              <TextInput
-                value={reason}
-                onChangeText={setReason}
-                placeholder="Reason (required)"
-                placeholderTextColor={theme.textMuted}
-                style={[styles.modalInput, { fontSize: 16, fontWeight: "400", textAlign: "left" }]}
               />
             </>
           ) : null}
@@ -447,7 +448,7 @@ function ActionModal({
               onPress={onClose}
               style={[styles.modalButton, styles.modalCancel]}
             >
-              <Text style={[styles.modalButtonText, { color: theme.text }]}>
+              <Text style={[styles.modalButtonText, { color: colors.text }]}>
                 Cancel
               </Text>
             </Pressable>
@@ -457,7 +458,7 @@ function ActionModal({
               style={[
                 styles.modalButton,
                 styles.modalConfirm,
-                target.kind === "kick" && { backgroundColor: theme.danger },
+                target.kind === "kick" && { backgroundColor: colors.danger },
                 busy && styles.seatBtnDisabled,
               ]}
             >
@@ -477,11 +478,12 @@ function ActionModal({
 // =============================================================================
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: theme.bg },
+  container: { flex: 1, backgroundColor: colors.bg },
+  loading: { justifyContent: "center", alignItems: "center" },
   scroll: { padding: 16, paddingBottom: 32 },
-  muted: { color: theme.textMuted, fontSize: 14 },
+  muted: { color: colors.mute, fontSize: 14 },
   sectionLabel: {
-    color: theme.textMuted,
+    color: colors.mute,
     fontSize: 12,
     textTransform: "uppercase",
     letterSpacing: 1.5,
@@ -489,25 +491,25 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   dangerCard: {
-    backgroundColor: theme.surface,
-    borderColor: theme.danger,
+    backgroundColor: colors.surface,
+    borderColor: colors.danger,
     borderWidth: 1,
     borderRadius: 12,
     padding: 16,
   },
-  dangerCardTitle: { color: theme.danger, fontSize: 16, fontWeight: "700" },
-  dangerCardSub: { color: theme.textMuted, fontSize: 13, marginTop: 4 },
+  dangerCardTitle: { color: colors.danger, fontSize: 16, fontWeight: "700" },
+  dangerCardSub: { color: colors.mute, fontSize: 13, marginTop: 4 },
   linkCard: {
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 12,
     padding: 16,
   },
-  linkCardTitle: { color: theme.text, fontSize: 16, fontWeight: "700" },
+  linkCardTitle: { color: colors.text, fontSize: 16, fontWeight: "700" },
   seatCard: {
-    backgroundColor: theme.surface,
-    borderColor: theme.border,
+    backgroundColor: colors.surface,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 12,
     padding: 14,
@@ -515,7 +517,7 @@ const styles = StyleSheet.create({
   },
   seatHeader: { flexDirection: "row", alignItems: "center", marginBottom: 10 },
   colorDot: { width: 24, height: 24, borderRadius: 12 },
-  seatName: { color: theme.text, fontSize: 16, fontWeight: "600" },
+  seatName: { color: colors.text, fontSize: 16, fontWeight: "600" },
   seatActions: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   seatBtn: {
     paddingVertical: 10,
@@ -527,7 +529,7 @@ const styles = StyleSheet.create({
   seatBtnDisabled: { opacity: 0.35 },
   seatBtnText: { fontSize: 14, fontWeight: "600" },
   error: {
-    color: theme.danger,
+    color: colors.danger,
     marginTop: 8,
     textAlign: "center",
     fontSize: 13,
@@ -540,22 +542,22 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   modalCard: {
-    backgroundColor: theme.surface,
+    backgroundColor: colors.surface,
     borderRadius: 16,
     padding: 24,
     width: "100%",
     maxWidth: 360,
     borderWidth: 1,
-    borderColor: theme.border,
+    borderColor: colors.hair,
   },
-  modalTitle: { color: theme.text, fontSize: 20, fontWeight: "700" },
-  modalSubtitle: { color: theme.textMuted, fontSize: 14, marginTop: 8 },
+  modalTitle: { color: colors.text, fontSize: 20, fontWeight: "700" },
+  modalSubtitle: { color: colors.mute, fontSize: 14, marginTop: 8 },
   modalInput: {
-    backgroundColor: theme.surfaceElevated,
-    borderColor: theme.border,
+    backgroundColor: colors.raised,
+    borderColor: colors.hair,
     borderWidth: 1,
     borderRadius: 10,
-    color: theme.text,
+    color: colors.text,
     fontSize: 28,
     fontWeight: "700",
     paddingHorizontal: 14,
@@ -572,9 +574,9 @@ const styles = StyleSheet.create({
   },
   modalCancel: {
     backgroundColor: "transparent",
-    borderColor: theme.border,
+    borderColor: colors.hair,
     borderWidth: 1,
   },
-  modalConfirm: { backgroundColor: theme.accent },
-  modalButtonText: { color: theme.bg, fontWeight: "700", fontSize: 16 },
+  modalConfirm: { backgroundColor: colors.gold },
+  modalButtonText: { color: colors.bg, fontWeight: "700", fontSize: 16 },
 });

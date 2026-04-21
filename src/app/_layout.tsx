@@ -1,4 +1,3 @@
-import { theme } from "@/lib/colors";
 import { ConvexProvider, ConvexReactClient } from "convex/react";
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -15,20 +14,29 @@ export default function RootLayout() {
         <StatusBar style="light" />
         <Stack
           screenOptions={{
-            headerStyle: { backgroundColor: theme.bg },
-            headerTintColor: theme.text,
-            contentStyle: { backgroundColor: theme.bg },
             headerShown: false,
+            gestureEnabled: true,
           }}
         >
-          <Stack.Screen name="index" />
-          <Stack.Screen name="onboarding" />
-          <Stack.Screen name="join" />
-          <Stack.Screen name="create" />
-          <Stack.Screen name="table/[code]/lobby" />
-          <Stack.Screen name="table/[code]/hand" />
-          <Stack.Screen name="table/[code]/history" />
-          <Stack.Screen name="table/[code]/settle" />
+          <Stack.Screen
+            name="table/[code]/lobby"
+            options={{
+              gestureEnabled: false,
+              animation: "none",
+            }}
+          />
+          <Stack.Screen
+            name="table/[code]/hand"
+            options={{ gestureEnabled: false }}
+          />
+          <Stack.Screen
+            name="table/[code]/history"
+            options={{ gestureEnabled: false }}
+          />
+          <Stack.Screen
+            name="table/[code]/settle"
+            options={{ gestureEnabled: false }}
+          />
         </Stack>
       </SafeAreaProvider>
     </ConvexProvider>

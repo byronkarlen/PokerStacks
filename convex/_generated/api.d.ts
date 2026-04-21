@@ -8,9 +8,11 @@
  * @module
  */
 
-import type * as devices from "../devices.js";
 import type * as hands from "../hands.js";
+import type * as palette from "../palette.js";
+import type * as reset from "../reset.js";
 import type * as tables from "../tables.js";
+import type * as users from "../users.js";
 
 import type {
   ApiFromModules,
@@ -19,9 +21,11 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
-  devices: typeof devices;
   hands: typeof hands;
+  palette: typeof palette;
+  reset: typeof reset;
   tables: typeof tables;
+  users: typeof users;
 }>;
 
 /**
