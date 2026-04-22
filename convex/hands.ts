@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import { Doc, Id } from "./_generated/dataModel";
 import { mutation, MutationCtx, query, QueryCtx } from "./_generated/server";
+import { requireAuth } from "./authHelpers";
 
 // =============================================================================
 // Types
@@ -22,11 +23,11 @@ type ActionType = Action["type"];
  */
 async function getActiveSeats(
   ctx: QueryCtx | MutationCtx,
-  tableId: Id<"tables">,
+  gameId: Id<"games">,
 ): Promise<Seat[]> {
   const seats = await ctx.db
     .query("seats")
-    .withIndex("by_table", (q) => q.eq("tableId", tableId))
+    .withIndex("by_game", (q) => q.eq("gameId", gameId))
     .collect();
   return seats
     .filter((s) => s.status === "active")
@@ -49,16 +50,12 @@ function nextInRing(ring: Seat[], fromIndex: number): Seat | null {
 // =============================================================================
 
 type HandState = {
-  liveActions: Action[];
-  // Total chips committed across the whole hand, per seatId.
+  actions: Action[];
   committedTotal: Map<Id<"seats">, number>;
-  // Chips committed on the current street, per seatId.
   committedStreet: Map<Id<"seats">, number>;
-  // Has this seat made any voluntary (non-blind) action on the current street?
   actedThisStreet: Set<Id<"seats">>;
   folded: Set<Id<"seats">>;
   allIn: Set<Id<"seats">>;
-  // Highest sequence number used on this hand.
   lastSequence: number;
 };
 
@@ -70,7 +67,6 @@ async function getHandState(
     .query("actions")
     .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
     .collect();
-  const live = all.filter((a) => !a.undone);
 
   const committedTotal = new Map<Id<"seats">, number>();
   const committedStreet = new Map<Id<"seats">, number>();
@@ -86,9 +82,6 @@ async function getHandState(
 
   for (const a of all) {
     lastSequence = Math.max(lastSequence, a.sequence);
-  }
-
-  for (const a of live) {
     committedTotal.set(
       a.seatId,
       (committedTotal.get(a.seatId) ?? 0) + a.amount,
@@ -107,7 +100,7 @@ async function getHandState(
   }
 
   return {
-    liveActions: live,
+    actions: all,
     committedTotal,
     committedStreet,
     actedThisStreet,
@@ -121,15 +114,6 @@ async function getHandState(
 // Queries
 // =============================================================================
 
-export const getCurrentHand = query({
-  args: { tableId: v.id("tables") },
-  handler: async (ctx, args) => {
-    const table = await ctx.db.get(args.tableId);
-    if (!table || !table.currentHandId) return null;
-    return await ctx.db.get(table.currentHandId);
-  },
-});
-
 export const getActions = query({
   args: { handId: v.id("hands") },
   handler: async (ctx, args) => {
@@ -140,140 +124,110 @@ export const getActions = query({
   },
 });
 
-export const getHandResult = query({
-  args: { handId: v.id("hands") },
-  handler: async (ctx, args) => {
-    return await ctx.db
-      .query("handResults")
-      .withIndex("by_hand", (q) => q.eq("handId", args.handId))
-      .unique();
-  },
-});
+type Pot = {
+  index: number;
+  amount: number;
+  eligibleSeatIds: Id<"seats">[];
+};
 
 /**
- * Compute the pot structure for a hand, applying the side-pot algorithm from
- * plan §11. Returns an array of pots ordered smallest side pot first, main
- * pot last. Each pot lists its amount and the seat IDs eligible to win it
+ * Compute the pot structure for a hand, applying the side-pot algorithm.
+ * Returns an array of pots ordered smallest side pot first, main pot last.
+ * Each pot lists its amount and the seat IDs eligible to win it
  * (non-folded, with at least the pot's commitment level).
  */
+async function computePotStructure(
+  ctx: QueryCtx | MutationCtx,
+  hand: Hand,
+): Promise<{ pot: number; pots: Pot[] }> {
+  const all = await ctx.db
+    .query("actions")
+    .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
+    .collect();
+
+  // Per-seat totals across the whole hand.
+  const total = new Map<Id<"seats">, number>();
+  const folded = new Set<Id<"seats">>();
+  const allInSet = new Set<Id<"seats">>();
+  for (const a of all) {
+    total.set(a.seatId, (total.get(a.seatId) ?? 0) + a.amount);
+    if (a.type === "fold") folded.add(a.seatId);
+    if (a.type === "all_in") allInSet.add(a.seatId);
+  }
+
+  // Distinct all-in commitment levels, ascending.
+  const allInLevels = Array.from(
+    new Set(
+      Array.from(allInSet).map((sid) => total.get(sid) ?? 0).filter((v) => v > 0),
+    ),
+  ).sort((a, b) => a - b);
+
+  const pots: Pot[] = [];
+  let prev = 0;
+  let potIndex = 0;
+
+  // pots[0] is the "main pot" in poker parlance: the slice everyone
+  // contributed to (up to the smallest all-in level). Each subsequent pot
+  // is a side pot built from chips above the previous level, with a
+  // strictly smaller eligibility set.
+  //
+  // Amount sums EVERY seat's contribution to this band — including folders
+  // whose total fell below the level. Eligibility still requires having
+  // matched the full level AND not folded.
+  for (const level of allInLevels) {
+    const amount = Array.from(total.values()).reduce(
+      (sum, t) => sum + (Math.min(t, level) - Math.min(t, prev)),
+      0,
+    );
+    const eligible = Array.from(total.entries())
+      .filter(([sid, t]) => t >= level && !folded.has(sid))
+      .map(([sid]) => sid);
+    if (amount > 0) {
+      pots.push({ index: potIndex++, amount, eligibleSeatIds: eligible });
+    }
+    prev = level;
+  }
+
+  // Residual side pot: chips bet ABOVE the highest all-in level by
+  // non-all-in seats (the deepest side pot).
+  const mainContribs = Array.from(total.entries()).filter(
+    ([sid, t]) => !allInSet.has(sid) && t > prev,
+  );
+  const mainAmount = mainContribs.reduce((acc, [, t]) => acc + (t - prev), 0);
+  if (mainAmount > 0) {
+    const eligible = mainContribs
+      .filter(([sid]) => !folded.has(sid))
+      .map(([sid]) => sid);
+    pots.push({ index: potIndex++, amount: mainAmount, eligibleSeatIds: eligible });
+  }
+
+  // Fallback: no all-ins happened, so there's only a main pot.
+  if (pots.length === 0 && hand.pot > 0) {
+    const eligible = Array.from(total.keys()).filter((sid) => !folded.has(sid));
+    pots.push({
+      index: 0,
+      amount: hand.pot,
+      eligibleSeatIds: eligible,
+    });
+  }
+
+  return { pot: hand.pot, pots };
+}
+
 export const getPotStructure = query({
   args: { handId: v.id("hands") },
   handler: async (ctx, args) => {
     const hand = await ctx.db.get(args.handId);
     if (!hand) return null;
-
-    const all = await ctx.db
-      .query("actions")
-      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
-      .collect();
-    const live = all.filter((a) => !a.undone);
-
-    // Per-seat totals across the whole hand.
-    const total = new Map<Id<"seats">, number>();
-    const folded = new Set<Id<"seats">>();
-    const allInSet = new Set<Id<"seats">>();
-    for (const a of live) {
-      total.set(a.seatId, (total.get(a.seatId) ?? 0) + a.amount);
-      if (a.type === "fold") folded.add(a.seatId);
-      if (a.type === "all_in") allInSet.add(a.seatId);
-    }
-
-    // Distinct all-in commitment levels, ascending.
-    const allInLevels = Array.from(
-      new Set(
-        Array.from(allInSet).map((sid) => total.get(sid) ?? 0).filter((v) => v > 0),
-      ),
-    ).sort((a, b) => a - b);
-
-    type Pot = {
-      index: number;
-      amount: number;
-      eligibleSeatIds: Id<"seats">[];
-      isMain: boolean;
-    };
-
-    const pots: Pot[] = [];
-    let prev = 0;
-    let potIndex = 0;
-
-    // Side pots (one per distinct all-in level, smallest first).
-    for (const level of allInLevels) {
-      const contributorsAtLevel = Array.from(total.entries()).filter(
-        ([, t]) => t >= level,
-      );
-      const amount = (level - prev) * contributorsAtLevel.length;
-      if (amount > 0) {
-        const eligible = contributorsAtLevel
-          .filter(([sid]) => !folded.has(sid))
-          .map(([sid]) => sid);
-        pots.push({ index: potIndex++, amount, eligibleSeatIds: eligible, isMain: false });
-      }
-      prev = level;
-    }
-
-    // Main pot: chips bet ABOVE the highest all-in level by non-all-in seats.
-    const mainContribs = Array.from(total.entries()).filter(
-      ([sid, t]) => !allInSet.has(sid) && t > prev,
-    );
-    const mainAmount = mainContribs.reduce((acc, [, t]) => acc + (t - prev), 0);
-    if (mainAmount > 0) {
-      const eligible = mainContribs
-        .filter(([sid]) => !folded.has(sid))
-        .map(([sid]) => sid);
-      pots.push({ index: potIndex++, amount: mainAmount, eligibleSeatIds: eligible, isMain: true });
-    }
-
-    // No all-ins, no main side pots — degenerate "no pots" case shouldn't happen
-    // for a real hand. Fallback: a single pot with everyone non-folded eligible.
-    if (pots.length === 0 && hand.pot > 0) {
-      const eligible = Array.from(total.keys()).filter((sid) => !folded.has(sid));
-      pots.push({
-        index: 0,
-        amount: hand.pot,
-        eligibleSeatIds: eligible,
-        isMain: true,
-      });
-    }
-
-    return { pot: hand.pot, pots };
+    return await computePotStructure(ctx, hand);
   },
 });
 
-/**
- * Returns up to N completed (or voided) hands at this table, newest first,
- * each bundled with its action stream and result. For the history screen.
- */
-export const getHandHistory = query({
-  args: { tableId: v.id("tables"), limit: v.optional(v.number()) },
-  handler: async (ctx, args) => {
-    const limit = args.limit ?? 100;
-    const hands = await ctx.db
-      .query("hands")
-      .withIndex("by_table_and_number", (q) => q.eq("tableId", args.tableId))
-      .order("desc")
-      .take(limit);
-
-    return await Promise.all(
-      hands.map(async (hand) => {
-        const actions = await ctx.db
-          .query("actions")
-          .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
-          .collect();
-        const result = await ctx.db
-          .query("handResults")
-          .withIndex("by_hand", (q) => q.eq("handId", hand._id))
-          .unique();
-        return { hand, actions, result };
-      }),
-    );
-  },
-});
-
-// Lightweight bundle for the active hand UI: hand + all live actions + result.
+// Lightweight bundle for the active hand UI: hand + actions + result.
 export const getHandView = query({
-  args: { tableId: v.id("tables") },
+  args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
-    const table = await ctx.db.get(args.tableId);
+    const table = await ctx.db.get(args.gameId);
     if (!table || !table.currentHandId) return null;
     const hand = await ctx.db.get(table.currentHandId);
     if (!hand) return null;
@@ -290,123 +244,161 @@ export const getHandView = query({
 });
 
 // =============================================================================
-// startHand
+// startHand — creates a new hand, posts blinds, sets first to act.
+// Shared by the host's manual start (first hand) and auto-start after
+// pickPotWinner finalizes a hand.
 // =============================================================================
 
-export const startHand = mutation({
-  args: { userId: v.id("users"), tableId: v.id("tables") },
-  handler: async (ctx, args) => {
-    const table = await ctx.db.get(args.tableId);
-    if (!table) throw new Error("Table not found");
-    if (table.hostUserId !== args.userId) throw new Error("Host only");
-    if (table.status === "ended") throw new Error("Game has ended");
+async function initiateHand(
+  ctx: MutationCtx,
+  game: Doc<"games">,
+): Promise<Id<"hands"> | null> {
+  // Seats eligible to be dealt into this hand: active and with chips.
+  const allActive = await getActiveSeats(ctx, game._id);
+  const ring = allActive.filter((s) => s.chipStack > 0);
+  if (ring.length < 2) return null;
 
-    // The previous hand must be complete or voided before a new one starts.
-    if (table.currentHandId) {
-      const prev = await ctx.db.get(table.currentHandId);
-      if (prev && prev.street !== "complete" && !prev.voided) {
+  // Dealer button: first active seat for hand #1, otherwise rotate clockwise.
+  const dealerSeat =
+    game.dealerSeatIndex < 0
+      ? ring[0]
+      : (nextInRing(ring, game.dealerSeatIndex) ?? ring[0]);
+
+  // Blinds positioning.
+  let sbSeat: Seat;
+  let bbSeat: Seat;
+  if (ring.length === 2) {
+    sbSeat = dealerSeat;
+    bbSeat = ring.find((s) => s._id !== dealerSeat._id)!;
+  } else {
+    sbSeat = nextInRing(ring, dealerSeat.seatIndex)!;
+    bbSeat = nextInRing(ring, sbSeat.seatIndex)!;
+  }
+
+  // First-to-act preflop.
+  const firstToAct =
+    ring.length === 2
+      ? sbSeat
+      : (nextInRing(ring, bbSeat.seatIndex) ?? sbSeat);
+
+  // Hand number = previous max + 1.
+  const recent = await ctx.db
+    .query("hands")
+    .withIndex("by_game_and_number", (q) => q.eq("gameId", game._id))
+    .order("desc")
+    .take(1);
+  const handNumber = (recent[0]?.handNumber ?? 0) + 1;
+
+  const handId = await ctx.db.insert("hands", {
+    gameId: game._id,
+    handNumber,
+    dealerSeatIndex: dealerSeat.seatIndex,
+    street: "preflop",
+    pot: 0,
+    currentBet: 0,
+    minRaise: game.bigBlind,
+    toActSeatIndex: firstToAct.seatIndex,
+  });
+
+  // Post blinds. Stacks may be smaller than the blind — clamp.
+  const sbAmount = Math.min(game.smallBlind, sbSeat.chipStack);
+  const bbAmount = Math.min(game.bigBlind, bbSeat.chipStack);
+
+  let sequence = 1;
+  await ctx.db.insert("actions", {
+    handId,
+    seatId: sbSeat._id,
+    street: "preflop",
+    type: "post_sb",
+    amount: sbAmount,
+    sequence: sequence++,
+  });
+  await ctx.db.patch(sbSeat._id, { chipStack: sbSeat.chipStack - sbAmount });
+
+  await ctx.db.insert("actions", {
+    handId,
+    seatId: bbSeat._id,
+    street: "preflop",
+    type: "post_bb",
+    amount: bbAmount,
+    sequence: sequence++,
+  });
+  await ctx.db.patch(bbSeat._id, { chipStack: bbSeat.chipStack - bbAmount });
+
+  await ctx.db.patch(handId, {
+    pot: sbAmount + bbAmount,
+    currentBet: Math.max(sbAmount, bbAmount),
+  });
+
+  await ctx.db.patch(game._id, {
+    dealerSeatIndex: dealerSeat.seatIndex,
+    currentHandId: handId,
+  });
+
+  return handId;
+}
+
+// Flip any active seat with 0 chips to "inactive" — they're busted and
+// should sit out subsequent hands. Called at every hand-completion path
+// AFTER winners have been credited, so only truly busted seats get flipped.
+async function markBustedSeats(
+  ctx: MutationCtx,
+  gameId: Id<"games">,
+): Promise<void> {
+  const seats = await ctx.db
+    .query("seats")
+    .withIndex("by_game", (q) => q.eq("gameId", gameId))
+    .collect();
+  for (const s of seats) {
+    if (s.status === "active" && s.chipStack === 0) {
+      await ctx.db.patch(s._id, { status: "inactive" });
+    }
+  }
+}
+
+// Try to deal the next hand. If fewer than 2 seats still have chips, the
+// game can't continue — auto-settle by marking it ended. Used at both hand
+// completion paths (pickPotWinner's final step and the single-survivor
+// branch of recordAction).
+async function initiateNextOrEnd(
+  ctx: MutationCtx,
+  game: Doc<"games">,
+): Promise<void> {
+  const newHandId = await initiateHand(ctx, game);
+  if (newHandId) return;
+  await ctx.db.patch(game._id, { status: "ended" });
+  const seats = await ctx.db
+    .query("seats")
+    .withIndex("by_game", (q) => q.eq("gameId", game._id))
+    .collect();
+  for (const s of seats) {
+    if (s.status === "active" || s.status === "inactive") {
+      await ctx.db.patch(s._id, { status: "cashed_out" });
+    }
+  }
+}
+
+// Public: host starts a new hand. Usually only needed for the very first
+// hand; subsequent hands auto-start after the prior one finalizes.
+export const startHand = mutation({
+  args: { gameId: v.id("games") },
+  handler: async (ctx, args) => {
+    const userId = await requireAuth(ctx);
+    const game = await ctx.db.get(args.gameId);
+    if (!game) throw new Error("Game not found");
+    if (game.hostUserId !== userId) throw new Error("Host only");
+    if (game.status === "ended") throw new Error("Game has ended");
+    if (game.status !== "active") throw new Error("Game not started");
+
+    if (game.currentHandId) {
+      const prev = await ctx.db.get(game.currentHandId);
+      if (prev && prev.street !== "complete") {
         throw new Error("Previous hand still in progress");
       }
     }
 
-    // Seats eligible to be dealt into this hand: active and with chips.
-    // (A 0-chip "active" seat is one that busted last hand — they need a
-    // host rebuy before being dealt back in.)
-    const allActive = await getActiveSeats(ctx, table._id);
-    const ring = allActive.filter((s) => s.chipStack > 0);
-    if (ring.length < 2) {
-      throw new Error("Need at least 2 active seats with chips");
-    }
-
-    // Dealer button: first active seat for hand #1, otherwise rotate clockwise.
-    const dealerSeat =
-      table.dealerSeatIndex < 0
-        ? ring[0]
-        : (nextInRing(ring, table.dealerSeatIndex) ?? ring[0]);
-
-    // Blinds positioning:
-    //   Heads-up: dealer posts SB; the other seat posts BB.
-    //   3+:       SB is next active after dealer; BB is next after SB.
-    let sbSeat: Seat;
-    let bbSeat: Seat;
-    if (ring.length === 2) {
-      sbSeat = dealerSeat;
-      bbSeat = ring.find((s) => s._id !== dealerSeat._id)!;
-    } else {
-      sbSeat = nextInRing(ring, dealerSeat.seatIndex)!;
-      bbSeat = nextInRing(ring, sbSeat.seatIndex)!;
-    }
-
-    // First-to-act preflop:
-    //   Heads-up: dealer/SB acts first.
-    //   3+:       UTG = first active after BB.
-    const firstToAct =
-      ring.length === 2
-        ? sbSeat
-        : (nextInRing(ring, bbSeat.seatIndex) ?? sbSeat);
-
-    // Hand number = previous max + 1.
-    const recent = await ctx.db
-      .query("hands")
-      .withIndex("by_table_and_number", (q) => q.eq("tableId", table._id))
-      .order("desc")
-      .take(1);
-    const handNumber = (recent[0]?.handNumber ?? 0) + 1;
-
-    const handId = await ctx.db.insert("hands", {
-      tableId: table._id,
-      handNumber,
-      dealerSeatIndex: dealerSeat.seatIndex,
-      street: "preflop",
-      pot: 0,
-      currentBet: 0,
-      minRaise: table.bigBlind,
-      toActSeatIndex: firstToAct.seatIndex,
-      voided: false,
-    });
-
-    // Post blinds. Stacks may be smaller than the blind (rare, mid-game) — clamp.
-    const sbAmount = Math.min(table.smallBlind, sbSeat.chipStack);
-    const bbAmount = Math.min(table.bigBlind, bbSeat.chipStack);
-
-    let sequence = 1;
-    await ctx.db.insert("actions", {
-      handId,
-      tableId: table._id,
-      seatId: sbSeat._id,
-      seatIndex: sbSeat.seatIndex,
-      street: "preflop",
-      type: "post_sb",
-      amount: sbAmount,
-      sequence: sequence++,
-      undone: false,
-    });
-    await ctx.db.patch(sbSeat._id, { chipStack: sbSeat.chipStack - sbAmount });
-
-    await ctx.db.insert("actions", {
-      handId,
-      tableId: table._id,
-      seatId: bbSeat._id,
-      seatIndex: bbSeat.seatIndex,
-      street: "preflop",
-      type: "post_bb",
-      amount: bbAmount,
-      sequence: sequence++,
-      undone: false,
-    });
-    await ctx.db.patch(bbSeat._id, { chipStack: bbSeat.chipStack - bbAmount });
-
-    await ctx.db.patch(handId, {
-      pot: sbAmount + bbAmount,
-      currentBet: Math.max(sbAmount, bbAmount),
-    });
-
-    await ctx.db.patch(table._id, {
-      status: "active",
-      dealerSeatIndex: dealerSeat.seatIndex,
-      currentHandId: handId,
-    });
-
+    const handId = await initiateHand(ctx, game);
+    if (!handId) throw new Error("Need at least 2 active seats with chips");
     return handId;
   },
 });
@@ -417,7 +409,6 @@ export const startHand = mutation({
 
 export const recordAction = mutation({
   args: {
-    userId: v.id("users"),
     handId: v.id("hands"),
     type: v.union(
       v.literal("check"),
@@ -430,43 +421,84 @@ export const recordAction = mutation({
     // For bet/raise, this is the TARGET amount (total commitment this street).
     // For call/fold/check/all_in it is ignored (computed server-side).
     amount: v.optional(v.number()),
+    // Optional: fold on behalf of the seat currently to act. Used when a
+    // player is physically away (in the bathroom, etc.) — any seated player
+    // can tap it. Restricted to "fold" only.
+    onBehalfOf: v.optional(v.id("seats")),
   },
   handler: async (ctx, args) => {
+    const userId = await requireAuth(ctx);
     const hand = await ctx.db.get(args.handId);
     if (!hand) throw new Error("Hand not found");
-    if (hand.voided) throw new Error("Hand was voided");
     if (hand.street === "complete") throw new Error("Hand already complete");
     if (hand.street === "showdown") {
       throw new Error("Hand is at showdown — award the pot");
     }
 
-    const table = await ctx.db.get(hand.tableId);
-    if (!table) throw new Error("Table not found");
+    const game = await ctx.db.get(hand.gameId);
+    if (!game) throw new Error("Game not found");
 
-    // Resolve caller's seat at this table.
-    const seat = await ctx.db
+    // The caller must be seated somewhere at this game.
+    const callerSeat = await ctx.db
       .query("seats")
-      .withIndex("by_table_and_user", (q) =>
-        q.eq("tableId", hand.tableId).eq("userId", args.userId),
+      .withIndex("by_game_and_user", (q) =>
+        q.eq("gameId", hand.gameId).eq("userId", userId),
       )
       .unique();
-    if (!seat) throw new Error("Not seated at this table");
+    if (!callerSeat) throw new Error("Not seated at this game");
 
-    if (hand.toActSeatIndex !== seat.seatIndex) {
+    // Resolve the seat that will actually take the action. Normally the
+    // caller acts for themselves; `onBehalfOf` lets anyone at the table fold
+    // the current actor when they're AFK.
+    let seat = callerSeat;
+    if (args.onBehalfOf) {
+      if (args.type !== "fold") {
+        throw new Error("Only fold is allowed on behalf of another seat");
+      }
+      const target = await ctx.db.get(args.onBehalfOf);
+      if (!target) throw new Error("Target seat not found");
+      if (target.gameId !== hand.gameId) {
+        throw new Error("Target seat is not at this game");
+      }
+      if (target.seatIndex !== hand.toActSeatIndex) {
+        throw new Error("Target seat is not currently to act");
+      }
+      seat = target;
+    } else if (hand.toActSeatIndex !== seat.seatIndex) {
       throw new Error("Not your turn");
     }
 
     const state = await getHandState(ctx, hand);
-    const ring = await getActiveSeats(ctx, hand.tableId);
+    const ring = await getActiveSeats(ctx, hand.gameId);
     const street = hand.street as Street;
 
     const callerStreetCommit = state.committedStreet.get(seat._id) ?? 0;
+    const thisActionSeq = state.lastSequence + 1;
+
+    // Reopening rule (TDA): a player can only raise if they have not already
+    // taken a voluntary action on this street since the last FULL raise. A
+    // short all-in (raise delta < minRaise) does not reopen the action.
+    // Uses `>=` so the player who made the last full raise cannot themselves
+    // re-raise without another aggressor in between.
+    const callerActedSinceReopen = (() => {
+      const reopenSeq = hand.lastFullRaiseSequence;
+      if (reopenSeq === undefined) return false;
+      return state.actions.some(
+        (a) =>
+          a.seatId === seat._id &&
+          a.street === street &&
+          a.sequence >= reopenSeq &&
+          a.type !== "post_sb" &&
+          a.type !== "post_bb",
+      );
+    })();
 
     // ----- Compute the action's chip delta + final commitment level -----
     let actionType: ActionType = args.type;
-    let chipDelta = 0; // chips moving from stack to pot this action
+    let chipDelta = 0;
     let newCurrentBet = hand.currentBet;
     let newMinRaise = hand.minRaise;
+    let newLastFullRaiseSeq = hand.lastFullRaiseSequence;
 
     switch (args.type) {
       case "check": {
@@ -484,11 +516,8 @@ export const recordAction = mutation({
         const need = hand.currentBet - callerStreetCommit;
         if (need <= 0) throw new Error("Nothing to call — check instead");
         if (need >= seat.chipStack) {
-          // Auto-convert to all-in if the call exceeds (or equals) the stack.
           chipDelta = seat.chipStack;
           actionType = "all_in";
-          // The all-in commitment may be below currentBet (cold call short),
-          // in which case currentBet does not change.
           const newStreetCommit = callerStreetCommit + chipDelta;
           if (newStreetCommit > newCurrentBet) {
             newMinRaise = Math.max(newMinRaise, newStreetCommit - newCurrentBet);
@@ -502,21 +531,25 @@ export const recordAction = mutation({
       case "bet": {
         if (hand.currentBet !== 0) throw new Error("Cannot bet — raise instead");
         const target = args.amount ?? 0;
-        if (!Number.isInteger(target) || target < table.bigBlind) {
-          throw new Error(`Bet must be at least ${table.bigBlind}`);
+        if (target < game.bigBlind) {
+          throw new Error(`Bet must be at least ${game.bigBlind}`);
         }
         if (target > seat.chipStack) throw new Error("Not enough chips");
         chipDelta = target - callerStreetCommit;
         if (chipDelta === seat.chipStack) actionType = "all_in";
         newCurrentBet = target;
         newMinRaise = target;
+        newLastFullRaiseSeq = thisActionSeq;
         break;
       }
       case "raise": {
         if (hand.currentBet === 0) throw new Error("Cannot raise — bet instead");
+        if (callerActedSinceReopen) {
+          throw new Error("Action is closed — can only call or fold");
+        }
         const target = args.amount ?? 0;
         const minLegalTarget = hand.currentBet + hand.minRaise;
-        if (!Number.isInteger(target) || target < minLegalTarget) {
+        if (target < minLegalTarget) {
           throw new Error(`Raise must be at least ${minLegalTarget}`);
         }
         chipDelta = target - callerStreetCommit;
@@ -524,6 +557,7 @@ export const recordAction = mutation({
         if (chipDelta === seat.chipStack) actionType = "all_in";
         newMinRaise = target - hand.currentBet;
         newCurrentBet = target;
+        newLastFullRaiseSeq = thisActionSeq;
         break;
       }
       case "all_in": {
@@ -532,11 +566,19 @@ export const recordAction = mutation({
         actionType = "all_in";
         const newStreetCommit = callerStreetCommit + chipDelta;
         if (newStreetCommit > newCurrentBet) {
-          // A raise-sized all-in resets minRaise. A short all-in does not.
+          // This all-in raises the current bet. If the caller already acted
+          // since the last full raise, they can only call or fold — an all-in
+          // that would raise is not a legal action for them.
+          if (callerActedSinceReopen) {
+            throw new Error("Action is closed — can only call or fold");
+          }
           const raiseDelta = newStreetCommit - newCurrentBet;
           if (raiseDelta >= hand.minRaise) {
             newMinRaise = raiseDelta;
+            newLastFullRaiseSeq = thisActionSeq;
           }
+          // Short all-in: leave newLastFullRaiseSeq unchanged — action does
+          // not reopen for players who've already acted.
           newCurrentBet = newStreetCommit;
         }
         break;
@@ -545,19 +587,14 @@ export const recordAction = mutation({
 
     if (chipDelta < 0) throw new Error("Negative chip delta");
 
-    const now = Date.now();
-
     // Insert the action row.
     await ctx.db.insert("actions", {
       handId: hand._id,
-      tableId: hand.tableId,
       seatId: seat._id,
-      seatIndex: seat.seatIndex,
       street,
       type: actionType,
       amount: chipDelta,
       sequence: state.lastSequence + 1,
-      undone: false,
     });
 
     // Debit the seat.
@@ -565,12 +602,8 @@ export const recordAction = mutation({
       await ctx.db.patch(seat._id, { chipStack: seat.chipStack - chipDelta });
     }
 
-    // ----- Determine next state: still on this street, advance, or complete -----
     // Re-read state after our insert.
-    const afterState = await getHandState(ctx, {
-      ...hand,
-      street,
-    } as Hand);
+    const afterState = await getHandState(ctx, { ...hand, street } as Hand);
 
     // Survivors = active seats not folded.
     const survivors = ring.filter((s) => !afterState.folded.has(s._id));
@@ -583,15 +616,13 @@ export const recordAction = mutation({
         pot: newPot,
         currentBet: newCurrentBet,
         minRaise: newMinRaise,
+        lastFullRaiseSequence: newLastFullRaiseSeq,
         toActSeatIndex: undefined,
         street: "complete",
-        completedAt: now,
       });
       await ctx.db.insert("handResults", {
         handId: hand._id,
-        tableId: hand.tableId,
         awards: [{ seatId: winner._id, potIndex: 0, amount: newPot }],
-        voided: false,
       });
       const winnerDoc = await ctx.db.get(winner._id);
       if (winnerDoc) {
@@ -599,15 +630,18 @@ export const recordAction = mutation({
           chipStack: winnerDoc.chipStack + newPot,
         });
       }
-      await ctx.db.patch(hand.tableId, { currentHandId: undefined });
+      await ctx.db.patch(hand.gameId, { currentHandId: undefined });
+      await markBustedSeats(ctx, hand.gameId);
+      // Auto-start next hand, or end the game if nobody can ante up.
+      const updatedGame = await ctx.db.get(hand.gameId);
+      if (updatedGame) await initiateNextOrEnd(ctx, updatedGame);
       return null;
     }
 
     // Live actors = survivors who can still bet (not all-in).
     const liveActors = survivors.filter((s) => !afterState.allIn.has(s._id));
 
-    // Street closed when every live actor has acted this street and their
-    // street commitment matches currentBet.
+    // Street closed when every live actor has acted and matches currentBet.
     const streetClosed = liveActors.every((s) => {
       const ok = afterState.actedThisStreet.has(s._id);
       const matched = (afterState.committedStreet.get(s._id) ?? 0) === newCurrentBet;
@@ -618,12 +652,10 @@ export const recordAction = mutation({
     let nextToAct: number | undefined;
 
     if (streetClosed) {
-      // If <=1 live actors, no more betting — straight to showdown.
       if (liveActors.length <= 1) {
         nextStreet = "showdown";
         nextToAct = undefined;
       } else {
-        // Advance street.
         nextStreet =
           street === "preflop"
             ? "flop"
@@ -636,19 +668,17 @@ export const recordAction = mutation({
         if (nextStreet === "showdown") {
           nextToAct = undefined;
         } else {
-          // First to act on flop/turn/river: first live actor clockwise from dealer.
           const liveRing = liveActors.sort(
             (a, b) => a.seatIndex - b.seatIndex,
           );
           const next = nextInRing(liveRing, hand.dealerSeatIndex);
           nextToAct = next?.seatIndex;
-          // Reset per-street counters by patching currentBet/minRaise.
           newCurrentBet = 0;
-          newMinRaise = table.bigBlind;
+          newMinRaise = game.bigBlind;
+          newLastFullRaiseSeq = undefined;
         }
       }
     } else {
-      // Find next seat to act: first live actor clockwise from current actor.
       const liveRing = liveActors.sort((a, b) => a.seatIndex - b.seatIndex);
       const next = nextInRing(liveRing, seat.seatIndex);
       nextToAct = next?.seatIndex;
@@ -658,6 +688,7 @@ export const recordAction = mutation({
       pot: hand.pot + chipDelta,
       currentBet: newCurrentBet,
       minRaise: newMinRaise,
+      lastFullRaiseSequence: newLastFullRaiseSeq,
       toActSeatIndex: nextToAct,
       street: nextStreet,
     });
@@ -667,68 +698,93 @@ export const recordAction = mutation({
 });
 
 // =============================================================================
-// awardPot — distribute the pot at showdown (multi-pot supported by §11)
+// pickPotWinner — incremental showdown resolution.
+//
+// Each pot gets picked with its own mutation call so every client stays in
+// sync on which pot is next. Selections are persisted on hand.pendingAwards;
+// when the final pot is picked, the same mutation finalizes the hand:
+// writes handResults, credits winners, completes the hand, and auto-starts
+// the next one.
 // =============================================================================
 
-export const awardPot = mutation({
+export const pickPotWinner = mutation({
   args: {
-    userId: v.id("users"),
     handId: v.id("hands"),
-    awards: v.array(
-      v.object({
-        seatId: v.id("seats"),
-        potIndex: v.number(),
-        amount: v.number(),
-      }),
-    ),
+    // The index into the pot-structure array (pots[0]=main, 1+=side).
+    // Clients pass the pot they believe is current; the server no-ops if
+    // another client has already picked it (racing clients).
+    potIndex: v.number(),
+    seatId: v.id("seats"),
   },
   handler: async (ctx, args) => {
+    const userId = await requireAuth(ctx);
     const hand = await ctx.db.get(args.handId);
     if (!hand) throw new Error("Hand not found");
-    if (hand.voided) throw new Error("Hand was voided");
 
-    // Idempotent: if the hand is already complete with a non-voided result,
-    // silently succeed. This handles concurrent showdown taps from §6.3 step 7.
-    if (hand.street === "complete") {
-      const existing = await ctx.db
-        .query("handResults")
-        .withIndex("by_hand", (q) => q.eq("handId", hand._id))
-        .unique();
-      if (existing && !existing.voided) return null;
-    }
-
-    if (hand.street !== "showdown" && hand.street !== "complete") {
+    // Idempotent: hand already finalized.
+    if (hand.street === "complete") return null;
+    if (hand.street !== "showdown") {
       throw new Error("Hand is not at showdown");
     }
 
-    // Caller must be seated at this table (any seated player can tap a winner;
-    // first one wins per the plan).
+    // Caller must be seated (any seated player can tap a winner; first wins).
     const callerSeat = await ctx.db
       .query("seats")
-      .withIndex("by_table_and_user", (q) =>
-        q.eq("tableId", hand.tableId).eq("userId", args.userId),
+      .withIndex("by_game_and_user", (q) =>
+        q.eq("gameId", hand.gameId).eq("userId", userId),
       )
       .unique();
-    if (!callerSeat) throw new Error("Not seated at this table");
+    if (!callerSeat) throw new Error("Not seated at this game");
 
-    // Validate awards sum equals the pot.
-    const awardTotal = args.awards.reduce((acc, a) => acc + a.amount, 0);
-    if (awardTotal !== hand.pot) {
-      throw new Error(
-        `Awards (${awardTotal}) must total the pot (${hand.pot})`,
-      );
+    const { pots } = await computePotStructure(ctx, hand);
+    const existing = hand.pendingAwards ?? [];
+    const expectedStep = existing.length;
+
+    // Race: someone else already picked for this pot. Silently accept so the
+    // tap doesn't error the UI — the query will push the new step shortly.
+    if (args.potIndex !== expectedStep) return null;
+    if (expectedStep >= pots.length) return null;
+
+    const currentPot = pots[expectedStep];
+    if (!currentPot.eligibleSeatIds.includes(args.seatId)) {
+      throw new Error("Seat not eligible for this pot");
     }
 
-    const now = Date.now();
+    // Append this pick, then auto-advance through any subsequent pots where
+    // the same winner is also eligible (matches the ordered side-pot
+    // structure — if you qualify for the smaller pot and also the larger
+    // one above it, you scoop both).
+    const newAwards = [
+      ...existing,
+      {
+        seatId: args.seatId,
+        potIndex: currentPot.index,
+        amount: currentPot.amount,
+      },
+    ];
+    let s = expectedStep + 1;
+    while (s < pots.length && pots[s].eligibleSeatIds.includes(args.seatId)) {
+      newAwards.push({
+        seatId: args.seatId,
+        potIndex: pots[s].index,
+        amount: pots[s].amount,
+      });
+      s++;
+    }
+
+    // More pots to resolve — persist progress so every client advances.
+    if (newAwards.length < pots.length) {
+      await ctx.db.patch(hand._id, { pendingAwards: newAwards });
+      return null;
+    }
+
+    // Final pot picked — finalize the hand.
     await ctx.db.insert("handResults", {
       handId: hand._id,
-      tableId: hand.tableId,
-      awards: args.awards,
-      voided: false,
+      awards: newAwards,
     });
 
-    // Credit each winner.
-    for (const award of args.awards) {
+    for (const award of newAwards) {
       const seat = await ctx.db.get(award.seatId);
       if (!seat) continue;
       await ctx.db.patch(seat._id, {
@@ -738,195 +794,15 @@ export const awardPot = mutation({
 
     await ctx.db.patch(hand._id, {
       street: "complete",
-      completedAt: now,
       toActSeatIndex: undefined,
+      pendingAwards: undefined,
     });
-    await ctx.db.patch(hand.tableId, { currentHandId: undefined });
+    await ctx.db.patch(hand.gameId, { currentHandId: undefined });
+    await markBustedSeats(ctx, hand.gameId);
 
-    return null;
-  },
-});
-
-// =============================================================================
-// undoLastAction (host) — reverses the most recent reversible event
-// =============================================================================
-
-export const undoLastAction = mutation({
-  args: { userId: v.id("users"), tableId: v.id("tables") },
-  handler: async (ctx, args) => {
-    const table = await ctx.db.get(args.tableId);
-    if (!table) throw new Error("Table not found");
-    if (table.hostUserId !== args.userId) throw new Error("Host only");
-
-    // Find the most recent hand at this table.
-    const recent = await ctx.db
-      .query("hands")
-      .withIndex("by_table_and_number", (q) => q.eq("tableId", args.tableId))
-      .order("desc")
-      .take(1);
-    const hand = recent[0];
-    if (!hand) throw new Error("No hand to undo");
-    if (hand.voided) throw new Error("Hand was voided — cannot undo");
-
-    const now = Date.now();
-
-    // Case 1: pot-award undo. Hand is complete with a non-voided result.
-    if (hand.street === "complete") {
-      const result = await ctx.db
-        .query("handResults")
-        .withIndex("by_hand", (q) => q.eq("handId", hand._id))
-        .unique();
-      if (result && !result.voided) {
-        // Reverse the stack credits.
-        for (const award of result.awards) {
-          const seat = await ctx.db.get(award.seatId);
-          if (!seat) continue;
-          await ctx.db.patch(seat._id, {
-            chipStack: seat.chipStack - award.amount,
-          });
-        }
-        await ctx.db.patch(result._id, { voided: true, voidedAt: now });
-        await ctx.db.patch(hand._id, {
-          street: "showdown",
-          completedAt: undefined,
-        });
-        await ctx.db.patch(table._id, { currentHandId: hand._id });
-        return { kind: "pot_award" as const };
-      }
-    }
-
-    // Case 2: action undo. Find the last non-undone action of this hand.
-    const allActions = await ctx.db
-      .query("actions")
-      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
-      .order("desc")
-      .collect();
-    const last = allActions.find((a) => !a.undone);
-    if (!last) throw new Error("No action to undo");
-
-    // Don't allow undoing the auto-posted blinds (they'd leave the hand in a
-    // half-set-up state). Hosts wanting to abandon a hand should void it.
-    if (last.type === "post_sb" || last.type === "post_bb") {
-      throw new Error("Cannot undo blinds — void the hand instead");
-    }
-
-    // Mark undone and credit chips back.
-    await ctx.db.patch(last._id, {
-      undone: true,
-      undoneAt: now,
-      undoneByUserId: args.userId,
-    });
-    if (last.amount > 0) {
-      const seat = await ctx.db.get(last.seatId);
-      if (seat) {
-        await ctx.db.patch(seat._id, {
-          chipStack: seat.chipStack + last.amount,
-        });
-      }
-    }
-
-    // Recompute hand state from the remaining live actions.
-    const remaining = allActions.filter(
-      (a) => a._id !== last._id && !a.undone,
-    );
-    let pot = 0;
-    const committedByStreet: Record<string, Record<Id<"seats">, number>> = {
-      preflop: {},
-      flop: {},
-      turn: {},
-      river: {},
-    };
-    let highestStreetReached: Street = "preflop";
-    const streetOrder: Street[] = ["preflop", "flop", "turn", "river"];
-    for (const a of remaining) {
-      pot += a.amount;
-      const s = a.street as Street;
-      committedByStreet[s][a.seatId] =
-        (committedByStreet[s][a.seatId] ?? 0) + a.amount;
-      if (streetOrder.indexOf(s) > streetOrder.indexOf(highestStreetReached)) {
-        highestStreetReached = s;
-      }
-    }
-
-    // The new "current street" is the street of the action we just undid.
-    const newStreet = last.street as Street;
-    const streetCommits = committedByStreet[newStreet];
-    const newCurrentBet = Math.max(0, ...Object.values(streetCommits));
-    const newToAct = last.seatIndex;
-
-    await ctx.db.patch(hand._id, {
-      pot,
-      currentBet: newCurrentBet,
-      minRaise: table.bigBlind,
-      street: newStreet,
-      toActSeatIndex: newToAct,
-      completedAt: undefined,
-    });
-    await ctx.db.patch(table._id, { currentHandId: hand._id });
-
-    return { kind: "action" as const };
-  },
-});
-
-// =============================================================================
-// voidHand (host) — abandon the current hand, restore all stacks
-// =============================================================================
-
-export const voidHand = mutation({
-  args: { userId: v.id("users"), tableId: v.id("tables") },
-  handler: async (ctx, args) => {
-    const table = await ctx.db.get(args.tableId);
-    if (!table) throw new Error("Table not found");
-    if (table.hostUserId !== args.userId) throw new Error("Host only");
-    if (!table.currentHandId) throw new Error("No active hand");
-
-    const hand = await ctx.db.get(table.currentHandId);
-    if (!hand) throw new Error("Hand not found");
-    if (hand.voided) throw new Error("Already voided");
-
-    // Restore every stack by crediting back what each seat committed
-    // across all non-undone actions of this hand.
-    const all = await ctx.db
-      .query("actions")
-      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", hand._id))
-      .collect();
-    const refund = new Map<Id<"seats">, number>();
-    for (const a of all) {
-      if (a.undone) continue;
-      refund.set(a.seatId, (refund.get(a.seatId) ?? 0) + a.amount);
-    }
-    for (const [seatId, amount] of refund) {
-      const seat = await ctx.db.get(seatId);
-      if (!seat) continue;
-      await ctx.db.patch(seat._id, { chipStack: seat.chipStack + amount });
-    }
-
-    // If a result existed (mid-undo state), void it too so the credits
-    // don't get double-applied.
-    const result = await ctx.db
-      .query("handResults")
-      .withIndex("by_hand", (q) => q.eq("handId", hand._id))
-      .unique();
-    if (result && !result.voided) {
-      // Reverse the credits before voiding.
-      for (const award of result.awards) {
-        const seat = await ctx.db.get(award.seatId);
-        if (!seat) continue;
-        await ctx.db.patch(seat._id, {
-          chipStack: seat.chipStack - award.amount,
-        });
-      }
-      await ctx.db.patch(result._id, { voided: true, voidedAt: Date.now() });
-    }
-
-    const now = Date.now();
-    await ctx.db.patch(hand._id, {
-      voided: true,
-      street: "complete",
-      completedAt: now,
-      toActSeatIndex: undefined,
-    });
-    await ctx.db.patch(table._id, { currentHandId: undefined });
+    // Auto-start next hand, or end the game if nobody can ante up.
+    const updatedGame = await ctx.db.get(hand.gameId);
+    if (updatedGame) await initiateNextOrEnd(ctx, updatedGame);
 
     return null;
   },

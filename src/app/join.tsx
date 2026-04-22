@@ -1,5 +1,5 @@
 import { api } from "@/convex/_generated/api";
-import { useUserId } from "@/hooks/useUserId";
+import { useMe } from "@/hooks/useMe";
 import { colors, typography } from "@/theme";
 import { useMutation } from "convex/react";
 import * as Haptics from "expo-haptics";
@@ -18,15 +18,16 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 const CODE_LEN = 4;
 
-// Must mirror convex/tables.ts: CODE_ALPHABET (letters-only, ambiguous
+// Must mirror convex/games.ts: CODE_ALPHABET (letters-only, ambiguous
 // chars excluded). We validate client-side so users can't type a digit
 // or I/L/O and get a "not found" surprise.
 const VALID_CHARS = /^[ABCDEFGHJKMNPQRSTUVWXYZ]*$/;
 
 export default function Join() {
   const router = useRouter();
-  const userId = useUserId();
-  const joinTable = useMutation(api.tables.joinTable);
+  const me = useMe();
+  const userId = me?._id;
+  const joinTable = useMutation(api.games.joinGame);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +48,6 @@ export default function Join() {
     setError(null);
     try {
       const { code: actualCode } = await joinTable({
-        userId,
         code: code.trim(),
       });
       Haptics.notificationAsync(
@@ -174,12 +174,6 @@ const styles = StyleSheet.create({
     letterSpacing: -0.5,
     marginTop: 10,
   },
-  subtitle: {
-    color: colors.mute,
-    fontSize: 14,
-    lineHeight: 20,
-    marginTop: 10,
-  },
   codeWrap: {
     marginTop: 40,
     alignItems: "center",
@@ -221,7 +215,7 @@ const styles = StyleSheet.create({
     height: 1,
   },
   error: {
-    color: "#d07070",
+    color: colors.danger,
     fontSize: 13,
     textAlign: "center",
     marginTop: 16,

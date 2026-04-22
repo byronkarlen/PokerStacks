@@ -1,15 +1,18 @@
+import { authTables } from "@convex-dev/auth/server";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
 export default defineSchema({
-  // Anonymous user identity. The user's `_id` is stored client-side and
-  // sent on every request as the identity token.
+  ...authTables,
+
+  // Users table — we override the Convex Auth users schema with our own
   users: defineTable({
-    displayName: v.string(),
+    isAnonymous: v.boolean(),
+    displayName: (v.string()),
   }),
 
   // A game session. Lifecycle: lobby -> active -> ended.
-  tables: defineTable({
+  games: defineTable({
     code: v.string(), // 4-char uppercase alphanumeric
     hostUserId: v.id("users"),
     status: v.union(
@@ -24,43 +27,29 @@ export default defineSchema({
     currentHandId: v.optional(v.id("hands")),
   }).index("by_code", ["code"]),
 
-  // A position at a table held by one user.
+  // A position at a game held by one user.
   seats: defineTable({
-    tableId: v.id("tables"),
+    gameId: v.id("games"),
     userId: v.id("users"), // join to `users` for display name
     seatIndex: v.number(), // 0..N, stable across the session
     chipStack: v.number(),
-    color: v.string(), // palette key — scoped to this seat, unique per table
+    color: v.string(), // palette key — scoped to this seat, unique per game
     status: v.union(
-      v.literal("pending_buy_in"), // joined, host hasn't bought them in yet
       v.literal("active"),
-      v.literal("sitting_out"),
+      // Busted — 0 chips after a hand completed. Skipped by hand dealing
+      // and turn order, still rendered on the table as a spectator until
+      // the game ends.
+      v.literal("inactive"),
       v.literal("cashed_out"),
-      v.literal("kicked"),
     ),
   })
-    .index("by_table", ["tableId"])
-    .index("by_table_and_user", ["tableId", "userId"])
-    .index("by_table_and_seat", ["tableId", "seatIndex"])
+    .index("by_game", ["gameId"])
+    .index("by_game_and_user", ["gameId", "userId"])
     .index("by_user", ["userId"]),
 
-  // Buy-ins, rebuys, and cash-outs. Append-only.
-  transactions: defineTable({
-    tableId: v.id("tables"),
-    seatId: v.id("seats"),
-    type: v.union(
-      v.literal("buy_in"),
-      v.literal("rebuy"),
-      v.literal("cash_out"),
-    ),
-    amount: v.number(), // always positive; direction implied by type
-  })
-    .index("by_table", ["tableId"])
-    .index("by_seat", ["seatId"]),
-
-  // One row per hand played at a table.
+  // One row per hand played at a game.
   hands: defineTable({
-    tableId: v.id("tables"),
+    gameId: v.id("games"),
     handNumber: v.number(),
     dealerSeatIndex: v.number(),
     street: v.union(
@@ -74,19 +63,33 @@ export default defineSchema({
     pot: v.number(), // total chips committed across all streets
     currentBet: v.number(), // highest bet on current street
     minRaise: v.number(), // next legal raise increment
+    // Sequence of the last "full" aggression on the current street (bet, raise,
+    // or all-in whose raise delta >= minRaise). Used to enforce the reopening
+    // rule: a player who already acted past this sequence can only call or
+    // fold. Cleared at the start of each new street.
+    lastFullRaiseSequence: v.optional(v.number()),
     toActSeatIndex: v.optional(v.number()),
-    completedAt: v.optional(v.number()),
-    voided: v.boolean(), // true if host voided mid-hand
+    // Pot-winner picks made so far during multi-pot showdown selection. Set
+    // incrementally (one entry per pot as someone taps a winner) so every
+    // client stays in sync on which pot is being decided next. Cleared when
+    // the hand finalizes — the full set is written to `handResults`.
+    pendingAwards: v.optional(
+      v.array(
+        v.object({
+          seatId: v.id("seats"),
+          potIndex: v.number(),
+          amount: v.number(),
+        }),
+      ),
+    ),
   })
-    .index("by_table", ["tableId"])
-    .index("by_table_and_number", ["tableId", "handNumber"]),
+    .index("by_game", ["gameId"])
+    .index("by_game_and_number", ["gameId", "handNumber"]),
 
-  // Every betting event within a hand. Append-only with soft-delete via `undone`.
+  // Every betting event within a hand. Append-only.
   actions: defineTable({
     handId: v.id("hands"),
-    tableId: v.id("tables"), // denormalized for query convenience
     seatId: v.id("seats"),
-    seatIndex: v.number(), // snapshot for history rendering
     street: v.union(
       v.literal("preflop"),
       v.literal("flop"),
@@ -105,17 +108,11 @@ export default defineSchema({
     ),
     amount: v.number(), // chips committed by THIS action
     sequence: v.number(), // monotonic per hand, server-assigned
-    undone: v.boolean(),
-    undoneAt: v.optional(v.number()),
-    undoneByUserId: v.optional(v.id("users")),
-  })
-    .index("by_hand_and_sequence", ["handId", "sequence"])
-    .index("by_table", ["tableId"]),
+  }).index("by_hand_and_sequence", ["handId", "sequence"]),
 
-  // Result of a completed hand. Voided when host undoes pot award.
+  // Result of a completed hand.
   handResults: defineTable({
     handId: v.id("hands"),
-    tableId: v.id("tables"),
     awards: v.array(
       v.object({
         seatId: v.id("seats"),
@@ -123,8 +120,5 @@ export default defineSchema({
         amount: v.number(),
       }),
     ),
-    voided: v.boolean(),
-    voidedAt: v.optional(v.number()),
   }).index("by_hand", ["handId"]),
-
 });

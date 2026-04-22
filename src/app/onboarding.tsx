@@ -1,10 +1,10 @@
 import { api } from "@/convex/_generated/api";
-import { saveDisplayName, useDisplayName } from "@/hooks/useDisplayName";
-import { saveUserId, useUserId } from "@/hooks/useUserId";
+import { useMe } from "@/hooks/useMe";
 import { colors, typography } from "@/theme";
-import { useMutation } from "convex/react";
+import { useAuthActions } from "@convex-dev/auth/react";
+import { useConvexAuth, useMutation } from "convex/react";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   KeyboardAvoidingView,
   Platform,
@@ -19,42 +19,90 @@ import { SafeAreaView } from "react-native-safe-area-context";
 export default function Onboarding() {
   const router = useRouter();
   const { next } = useLocalSearchParams<{ next?: string }>();
-  const userId = useUserId();
-  const existingName = useDisplayName();
-  const upsertUser = useMutation(api.users.upsertUser);
-  const createTable = useMutation(api.tables.createTable);
+  const { isAuthenticated } = useConvexAuth();
+  const { signIn, signOut } = useAuthActions();
+  const me = useMe();
+  const setDisplayName = useMutation(api.users.setDisplayName);
+  const createTable = useMutation(api.games.createGame);
 
   const [name, setName] = useState("");
   const [savingName, setSavingName] = useState(false);
+  // After signIn, the Convex client needs a tick for its WebSocket auth to
+  // refresh. Firing createGame synchronously after `await signIn(...)` races
+  // with that refresh and the mutation hits the server as unauthenticated.
+  // Park the post-signIn `next` here and let an effect fire once auth has
+  // actually propagated (isAuthenticated true AND `me` resolved).
+  const [pendingNext, setPendingNext] = useState<string | null>(null);
+  const ranPendingRef = useRef(false);
 
   // Pre-fill when editing an existing name.
   useEffect(() => {
-    if (existingName) setName(existingName);
-  }, [existingName]);
+    if (me?.displayName) setName(me.displayName);
+  }, [me?.displayName]);
 
+  useEffect(() => {
+    if (!pendingNext || !isAuthenticated || !me || ranPendingRef.current) {
+      return;
+    }
+    ranPendingRef.current = true;
+    const target = pendingNext;
+    (async () => {
+      try {
+        if (target === "create") {
+          const { code } = await createTable({});
+          router.replace(`/table/${code}/lobby`);
+        } else {
+          router.replace(target as "/join");
+        }
+      } finally {
+        setSavingName(false);
+      }
+    })();
+  }, [pendingNext, isAuthenticated, me, createTable, router]);
+
+  // Wait until `me` has resolved one way or the other — otherwise we can't
+  // tell "editing existing user" from "stale token whose user was deleted".
   const canSubmit =
-    name.trim().length > 0 && userId !== undefined && !savingName;
+    name.trim().length > 0 &&
+    !savingName &&
+    pendingNext === null &&
+    me !== undefined;
 
   async function handleContinue() {
     if (!canSubmit) return;
     setSavingName(true);
+    const trimmed = name.trim();
     try {
-      const trimmed = name.trim();
-      const resolvedUserId = await upsertUser({
-        userId: userId ?? undefined,
-        displayName: trimmed,
-      });
-      await saveUserId(resolvedUserId);
-      await saveDisplayName(trimmed);
-      if (!next) {
-        router.back();
-      } else if (next === "create") {
-        const { code } = await createTable({ userId: resolvedUserId });
-        router.replace(`/table/${code}/lobby`);
+      // Edit mode only when BOTH the token is valid AND the user row exists.
+      // A stale token (e.g. DB was wiped since last launch) presents as
+      // isAuthenticated=true with me=null — we must re-sign-in in that case.
+      if (isAuthenticated && me) {
+        await setDisplayName({ displayName: trimmed });
+        if (!next) {
+          router.back();
+        } else if (next === "create") {
+          const { code } = await createTable({});
+          router.replace(`/table/${code}/lobby`);
+        } else {
+          router.replace(next as "/join");
+        }
+        setSavingName(false);
       } else {
-        router.replace(next as "/join");
+        // Stale token? Drop the old session before signing in fresh so the
+        // server isn't left with an orphaned session referencing a dead user.
+        if (isAuthenticated) {
+          await signOut();
+        }
+        await signIn("anonymous", { displayName: trimmed });
+        if (!next) {
+          router.back();
+          setSavingName(false);
+        } else {
+          // Wait for auth to propagate. Effect above finishes the flow.
+          setPendingNext(next);
+        }
       }
-    } finally {
+    } catch {
       setSavingName(false);
     }
   }
@@ -152,12 +200,6 @@ const styles = StyleSheet.create({
     fontFamily: typography.serif,
     fontStyle: "italic",
     fontSize: 38,
-  },
-  note: {
-    marginTop: 16,
-    color: colors.mute,
-    fontSize: 13,
-    lineHeight: 19,
   },
   cta: {
     backgroundColor: colors.gold,

@@ -1,34 +1,28 @@
+import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { requireAuth } from "./authHelpers";
 
-// Create a new user row or update an existing one's displayName.
-// Returns the user's _id. The client stores that _id locally as its identity
-// token and sends it on every subsequent mutation/query.
-export const upsertUser = mutation({
-  args: {
-    userId: v.optional(v.id("users")),
-    displayName: v.string(),
-  },
-  handler: async (ctx, args) => {
-    if (args.userId) {
-      const existing = await ctx.db.get(args.userId);
-      if (existing) {
-        if (existing.displayName !== args.displayName) {
-          await ctx.db.patch(args.userId, { displayName: args.displayName });
-        }
-        return args.userId;
-      }
-      // Stale userId (row was deleted) — fall through to insert a new row.
-    }
-    return await ctx.db.insert("users", {
-      displayName: args.displayName,
-    });
+// Returns the currently-authenticated user's row, or null if not signed in.
+export const getCurrentUser = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    return await ctx.db.get(userId);
   },
 });
 
-export const getUser = query({
-  args: { userId: v.id("users") },
+// Update the current user's display name. Used for the edit-name flow.
+// (First-time naming happens during signIn("anonymous", { displayName }).)
+export const setDisplayName = mutation({
+  args: { displayName: v.string() },
   handler: async (ctx, args) => {
-    return await ctx.db.get(args.userId);
+    const userId = await requireAuth(ctx);
+    const user = await ctx.db.get(userId);
+    // Token is valid but the user row has been deleted (e.g. DB wipe).
+    // Surface a signal the client can catch and recover from via re-signIn.
+    if (!user) throw new Error("User row missing — please sign in again");
+    await ctx.db.patch(userId, { displayName: args.displayName.trim() });
   },
 });

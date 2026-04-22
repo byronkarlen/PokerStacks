@@ -1,44 +1,42 @@
-import { ConvexProvider, ConvexReactClient } from "convex/react";
+import { ConvexAuthProvider } from "@convex-dev/auth/react";
+import { ConvexReactClient } from "convex/react";
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
+import * as SecureStore from "expo-secure-store";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
 const convex = new ConvexReactClient(process.env.EXPO_PUBLIC_CONVEX_URL!, {
   unsavedChangesWarning: false,
 });
 
+const secureStorage = {
+  getItem: SecureStore.getItemAsync,
+  setItem: SecureStore.setItemAsync,
+  removeItem: SecureStore.deleteItemAsync,
+};
+
 export default function RootLayout() {
   return (
-    <ConvexProvider client={convex}>
+    <ConvexAuthProvider client={convex} storage={secureStorage}>
       <SafeAreaProvider>
         <StatusBar style="light" />
         <Stack
           screenOptions={{
             headerShown: false,
-            gestureEnabled: true,
+            gestureEnabled: false,
+            animation: "none",
           }}
         >
           <Stack.Screen
-            name="table/[code]/lobby"
-            options={{
-              gestureEnabled: false,
-              animation: "none",
-            }}
+            name="onboarding"
+            options={{ gestureEnabled: true, animation: "default" }}
           />
           <Stack.Screen
-            name="table/[code]/hand"
-            options={{ gestureEnabled: false }}
-          />
-          <Stack.Screen
-            name="table/[code]/history"
-            options={{ gestureEnabled: false }}
-          />
-          <Stack.Screen
-            name="table/[code]/settle"
-            options={{ gestureEnabled: false }}
+            name="join"
+            options={{ gestureEnabled: true, animation: "default" }}
           />
         </Stack>
       </SafeAreaProvider>
-    </ConvexProvider>
+    </ConvexAuthProvider>
   );
 }

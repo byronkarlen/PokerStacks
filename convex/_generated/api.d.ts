@@ -8,10 +8,15 @@
  * @module
  */
 
+import type * as auth from "../auth.js";
+import type * as authHelpers from "../authHelpers.js";
+import type * as cleanup from "../cleanup.js";
+import type * as crons from "../crons.js";
+import type * as games from "../games.js";
 import type * as hands from "../hands.js";
+import type * as http from "../http.js";
 import type * as palette from "../palette.js";
 import type * as reset from "../reset.js";
-import type * as tables from "../tables.js";
 import type * as users from "../users.js";
 
 import type {
@@ -21,10 +26,15 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  auth: typeof auth;
+  authHelpers: typeof authHelpers;
+  cleanup: typeof cleanup;
+  crons: typeof crons;
+  games: typeof games;
   hands: typeof hands;
+  http: typeof http;
   palette: typeof palette;
   reset: typeof reset;
-  tables: typeof tables;
   users: typeof users;
 }>;
 

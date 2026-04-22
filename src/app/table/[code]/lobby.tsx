@@ -1,22 +1,23 @@
 import { api } from "@/convex/_generated/api";
-import { Doc, Id } from "@/convex/_generated/dataModel";
-import { useUserId } from "@/hooks/useUserId";
+import { Doc } from "@/convex/_generated/dataModel";
+import { useMe } from "@/hooks/useMe";
 import { colorHex, colors, typography } from "@/theme";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
 import { useMutation, useQuery } from "convex/react";
 import * as Haptics from "expo-haptics";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type SeatWithProfile = Doc<"seats"> & { displayName: string; color: string };
+type SeatWithProfile = Doc<"seats"> & { displayName: string };
 
 const TABLE_W = 340;
 const TABLE_H = 440;
-const SEAT_RX = 148;
+const SEAT_RX = 125;
 const SEAT_RY = 200;
-const PILL_W = 128;
-const PILL_H = 48;
+const PILL_W = 78;
+const PILL_H = 28;
 
 // "me" sits at angle π/2 (bottom of oval); everyone else rotates around.
 function seatPosition(index: number, total: number, meIndex: number) {
@@ -33,29 +34,23 @@ export default function Lobby() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
   const code = codeParam.toUpperCase();
-  const userId = useUserId();
+  const me = useMe();
+  const userId = me?._id;
 
-  const table = useQuery(api.tables.getByCode, { code });
+  const table = useQuery(api.games.getByCode, { code });
   const seats = useQuery(
-    api.tables.getSeatsWithProfile,
-    table ? { tableId: table._id } : "skip",
+    api.games.getSeatsWithProfile,
+    table ? { gameId: table._id } : "skip",
   );
 
-  const startGame = useMutation(api.tables.startGame);
-  const endGame = useMutation(api.tables.endGame);
-  const leaveTable = useMutation(api.tables.leaveTable);
-  const setInitialDealer = useMutation(api.tables.setInitialDealer);
-  const reorderSeats = useMutation(api.tables.reorderSeats);
-  const kickPlayer = useMutation(api.tables.kickPlayer);
+  const startGame = useMutation(api.games.startGame);
+  const endGame = useMutation(api.games.endGame);
+  const leaveTable = useMutation(api.games.leaveGame);
 
   useEffect(() => {
     if (table?.status === "active") {
       router.replace(`/table/${code}/hand`);
     } else if (table?.status === "ended") {
-      // Pop back to whatever pushed us here (usually home) so the transition
-      // slides left-to-right like a back gesture. If nothing is below
-      // (e.g. resumed directly into this screen on launch), fall back to
-      // replace which animates forward — not ideal but at least correct state.
       if (router.canGoBack()) {
         router.back();
       } else {
@@ -67,8 +62,6 @@ export default function Lobby() {
   const [startError, setStartError] = useState<string | null>(null);
   const [canceling, setCanceling] = useState(false);
   const [leaving, setLeaving] = useState(false);
-  const [swapSourceId, setSwapSourceId] = useState<Id<"seats"> | null>(null);
-  const [menuSeatId, setMenuSeatId] = useState<Id<"seats"> | null>(null);
 
   if (!table || !seats) {
     return (
@@ -88,8 +81,8 @@ export default function Lobby() {
     0,
     seats.findIndex((s) => s.userId === userId),
   );
-  // Backend stores -1 to mean "no explicit pick" → default to seat 0 for
-  // display. hands.ts will do the same thing when the first hand is dealt.
+  // Backend stores -1 until the first hand deals; hands.ts interprets that as
+  // seat 0 (the host), so display that same seat with the dealer button.
   const effectiveDealerIdx =
     table.dealerSeatIndex < 0 ? 0 : table.dealerSeatIndex;
 
@@ -98,7 +91,7 @@ export default function Lobby() {
     setStartError(null);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     try {
-      await startGame({ userId, tableId: table._id });
+      await startGame({ gameId: table._id });
     } catch (e) {
       setStartError(e instanceof Error ? e.message : "Failed to start");
     }
@@ -109,7 +102,7 @@ export default function Lobby() {
     setCanceling(true);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     try {
-      await endGame({ userId, tableId: table._id });
+      await endGame({ gameId: table._id });
     } catch {
       setCanceling(false);
     }
@@ -120,7 +113,7 @@ export default function Lobby() {
     setLeaving(true);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     try {
-      await leaveTable({ userId, tableId: table._id });
+      await leaveTable({ gameId: table._id });
       if (router.canGoBack()) {
         router.back();
       } else {
@@ -128,46 +121,6 @@ export default function Lobby() {
       }
     } catch {
       setLeaving(false);
-    }
-  }
-
-  async function handleMakeDealer(seatId: Id<"seats">) {
-    if (!userId || !table) return;
-    Haptics.selectionAsync().catch(() => {});
-    await setInitialDealer({ userId, tableId: table._id, seatId });
-  }
-
-  async function handleKick(seatId: Id<"seats">) {
-    if (!userId) return;
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
-    await kickPlayer({ userId, seatId });
-  }
-
-  async function handleSwap(targetSeatId: Id<"seats">) {
-    if (!swapSourceId || !userId || !table || !seats) return;
-    if (swapSourceId === targetSeatId) {
-      setSwapSourceId(null);
-      return;
-    }
-    const a = seats.findIndex((s) => s._id === swapSourceId);
-    const b = seats.findIndex((s) => s._id === targetSeatId);
-    if (a < 0 || b < 0) return;
-    const newOrder = seats.map((s) => s._id);
-    [newOrder[a], newOrder[b]] = [newOrder[b], newOrder[a]];
-    Haptics.selectionAsync().catch(() => {});
-    await reorderSeats({
-      userId,
-      tableId: table._id,
-      seatIdsInOrder: newOrder,
-    });
-    setSwapSourceId(null);
-  }
-
-  function handleSeatTap(seat: SeatWithProfile) {
-    if (swapSourceId) {
-      handleSwap(seat._id);
-    } else {
-      setMenuSeatId(seat._id);
     }
   }
 
@@ -187,9 +140,10 @@ export default function Lobby() {
       <View style={styles.tableWrap}>
         <View style={styles.tableArea}>
           <View style={styles.oval} />
-          <View style={styles.centerLabel}>
-            <Text style={styles.centerKicker}>On the table</Text>
-            <Text style={styles.centerValue}>{totalBB} BB</Text>
+          <View style={styles.potCenter}>
+            <View style={styles.potCard}>
+              <Text style={styles.potCardText}>Total: {totalBB}</Text>
+            </View>
           </View>
           {seats.map((seat, i) => (
             <SeatPill
@@ -198,11 +152,8 @@ export default function Lobby() {
               isHostSeat={seat.userId === table.hostUserId}
               isMe={seat.userId === userId}
               isDealer={seat.seatIndex === effectiveDealerIdx}
-              isSwapSource={swapSourceId === seat._id}
-              isSwapTarget={!!swapSourceId && swapSourceId !== seat._id}
               bigBlind={table.bigBlind}
               position={seatPosition(i, seats.length, meIndex)}
-              onPress={isHost ? () => handleSeatTap(seat) : undefined}
             />
           ))}
         </View>
@@ -248,106 +199,7 @@ export default function Lobby() {
           </>
         )}
       </View>
-
-      {swapSourceId ? (
-        <View style={styles.swapBanner}>
-          <Text style={styles.swapBannerText}>
-            Tap another seat to swap positions
-          </Text>
-          <Pressable
-            onPress={() => setSwapSourceId(null)}
-            hitSlop={12}
-          >
-            <Text style={styles.swapBannerCancel}>Cancel</Text>
-          </Pressable>
-        </View>
-      ) : null}
-
-      <SeatMenu
-        seat={
-          menuSeatId ? seats.find((s) => s._id === menuSeatId) ?? null : null
-        }
-        isCurrentDealer={
-          !!menuSeatId &&
-          seats.find((s) => s._id === menuSeatId)?.seatIndex ===
-            effectiveDealerIdx
-        }
-        isHostSeat={
-          !!menuSeatId &&
-          seats.find((s) => s._id === menuSeatId)?.userId ===
-            table.hostUserId
-        }
-        onClose={() => setMenuSeatId(null)}
-        onReorder={(seatId) => {
-          setSwapSourceId(seatId);
-          setMenuSeatId(null);
-        }}
-        onMakeDealer={(seatId) => {
-          handleMakeDealer(seatId);
-          setMenuSeatId(null);
-        }}
-        onKick={(seatId) => {
-          handleKick(seatId);
-          setMenuSeatId(null);
-        }}
-      />
     </SafeAreaView>
-  );
-}
-
-function SeatMenu({
-  seat,
-  isCurrentDealer,
-  isHostSeat,
-  onClose,
-  onReorder,
-  onMakeDealer,
-  onKick,
-}: {
-  seat: SeatWithProfile | null;
-  isCurrentDealer: boolean;
-  isHostSeat: boolean;
-  onClose: () => void;
-  onReorder: (seatId: Id<"seats">) => void;
-  onMakeDealer: (seatId: Id<"seats">) => void;
-  onKick: (seatId: Id<"seats">) => void;
-}) {
-  if (!seat) return null;
-  return (
-    <Modal transparent visible animationType="fade" onRequestClose={onClose}>
-      <Pressable style={styles.menuBackdrop} onPress={onClose}>
-        <Pressable style={styles.menuCard} onPress={() => {}}>
-          <Text style={styles.menuTitle}>{seat.displayName}</Text>
-          <Pressable
-            style={styles.menuItem}
-            onPress={() => onReorder(seat._id)}
-          >
-            <Text style={styles.menuItemText}>Reorder</Text>
-          </Pressable>
-          {!isCurrentDealer ? (
-            <Pressable
-              style={styles.menuItem}
-              onPress={() => onMakeDealer(seat._id)}
-            >
-              <Text style={styles.menuItemText}>Make dealer</Text>
-            </Pressable>
-          ) : null}
-          {!isHostSeat ? (
-            <Pressable
-              style={styles.menuItem}
-              onPress={() => onKick(seat._id)}
-            >
-              <Text style={[styles.menuItemText, styles.menuItemTextDanger]}>
-                Kick from table
-              </Text>
-            </Pressable>
-          ) : null}
-          <Pressable style={styles.menuItem} onPress={onClose}>
-            <Text style={styles.menuItemText}>Cancel</Text>
-          </Pressable>
-        </Pressable>
-      </Pressable>
-    </Modal>
   );
 }
 
@@ -356,24 +208,23 @@ function SeatPill({
   isHostSeat,
   isMe,
   isDealer,
-  isSwapSource,
-  isSwapTarget,
   bigBlind,
   position,
-  onPress,
 }: {
   seat: SeatWithProfile;
   isHostSeat: boolean;
   isMe: boolean;
   isDealer: boolean;
-  isSwapSource: boolean;
-  isSwapTarget: boolean;
   bigBlind: number;
   position: { left: number; top: number };
-  onPress?: () => void;
 }) {
-  const content = (
-    <>
+  return (
+    <View style={[styles.seatPill, position]}>
+      {isHostSeat ? (
+        <View style={styles.hostChip}>
+          <MaterialCommunityIcons name="crown" size={9} color={colors.bg} />
+        </View>
+      ) : null}
       {isDealer ? (
         <View style={styles.dealerButton}>
           <Text style={styles.dealerButtonText}>B</Text>
@@ -386,36 +237,11 @@ function SeatPill({
           {seat.displayName.slice(0, 1).toUpperCase()}
         </Text>
       </View>
-      <View style={styles.seatInfo}>
-        <Text style={styles.seatName} numberOfLines={1}>
-          {isMe ? "Me" : seat.displayName}
-          {isHostSeat ? <Text style={styles.seatBadge}>  HOST</Text> : null}
-        </Text>
+      <View style={styles.seatStackRow}>
         <Text style={styles.seatStack} numberOfLines={1}>
-          {seat.chipStack / bigBlind} BB
+          {seat.chipStack / bigBlind}
         </Text>
       </View>
-    </>
-  );
-  if (onPress) {
-    return (
-      <Pressable
-        onPress={onPress}
-        style={[
-          styles.seatPill,
-          position,
-          isMe && styles.seatPillMe,
-          isSwapSource && styles.seatPillSwapSource,
-          isSwapTarget && styles.seatPillSwapTarget,
-        ]}
-      >
-        {content}
-      </Pressable>
-    );
-  }
-  return (
-    <View style={[styles.seatPill, position, isMe && styles.seatPillMe]}>
-      {content}
     </View>
   );
 }
@@ -423,7 +249,6 @@ function SeatPill({
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   loading: { justifyContent: "center", alignItems: "center" },
-  loadingText: { color: colors.mute, fontSize: 14 },
 
   header: {
     flexDirection: "row",
@@ -468,119 +293,128 @@ const styles = StyleSheet.create({
   },
   oval: {
     position: "absolute",
-    left: (TABLE_W - 220) / 2,
-    top: (TABLE_H - 320) / 2,
-    width: 220,
-    height: 320,
+    left: (TABLE_W - 210) / 2,
+    top: (TABLE_H - 360) / 2,
+    width: 210,
+    height: 360,
     borderRadius: 160,
     backgroundColor: "#153023",
     borderWidth: 1,
     borderColor: "rgba(201,169,97,0.08)",
   },
-  centerLabel: {
+  potCenter: {
     position: "absolute",
     left: 0,
     right: 0,
-    top: TABLE_H / 2 - 28,
+    top: TABLE_H / 2 - 11,
     alignItems: "center",
   },
-  centerKicker: {
-    color: colors.mute,
-    fontSize: 10,
-    fontWeight: "600",
-    letterSpacing: 1.6,
-    textTransform: "uppercase",
+  potCard: {
+    height: 22,
+    paddingHorizontal: 10,
+    borderRadius: 11,
+    backgroundColor: "rgba(11,20,16,0.92)",
+    borderWidth: 1,
+    borderColor: colors.hairStrong,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    shadowColor: "#000",
+    shadowOpacity: 0.45,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
   },
-  centerValue: {
-    fontFamily: typography.serif,
-    fontStyle: "italic",
-    fontSize: 28,
-    color: colors.ivory,
-    marginTop: 4,
+  potCardText: {
+    color: colors.gold,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: -0.2,
+    fontVariant: ["tabular-nums"],
   },
 
   seatPill: {
     position: "absolute",
     width: PILL_W,
     height: PILL_H,
-    borderRadius: 24,
+    borderRadius: 10,
     backgroundColor: "#14231b",
     borderWidth: 1,
     borderColor: "rgba(201,169,97,0.18)",
     flexDirection: "row",
     alignItems: "center",
-    paddingLeft: 4,
+    paddingLeft: 6,
     paddingRight: 8,
-    gap: 8,
-  },
-  seatPillMe: {
-    borderColor: colors.gold,
-  },
-  seatPillSwapSource: {
-    borderColor: colors.ivory,
-    borderWidth: 2,
-    opacity: 1,
-  },
-  seatPillSwapTarget: {
-    opacity: 0.7,
+    gap: 6,
   },
   seatAvatar: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
     alignItems: "center",
     justifyContent: "center",
   },
   seatAvatarText: {
     color: "rgba(0,0,0,0.75)",
-    fontSize: 13,
+    fontSize: 10,
     fontWeight: "700",
     letterSpacing: -0.3,
   },
-  seatInfo: { flex: 1, minWidth: 0 },
-  seatName: {
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  seatBadge: {
-    color: colors.gold,
-    fontSize: 8,
-    fontWeight: "800",
-    letterSpacing: 0.6,
+  seatStackRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
   },
   seatStack: {
     fontFamily: typography.serif,
     fontStyle: "italic",
-    fontSize: 14,
+    fontSize: 13,
     color: colors.gold,
-    marginTop: 1,
   },
-  // Dealer "BUTTON" — a circular ivory chip that sits on the seat pill's
-  // corner. Poker convention: "B" = the Button (dealer position).
+  // "B" = the Button (dealer position), circular ivory chip bottom-right.
   dealerButton: {
     position: "absolute",
-    bottom: -8,
-    right: -8,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
+    bottom: -5,
+    right: -5,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
     backgroundColor: colors.ivory,
-    borderWidth: 2,
+    borderWidth: 1.5,
     borderColor: colors.bg,
     alignItems: "center",
     justifyContent: "center",
     zIndex: 2,
     shadowColor: "#000",
     shadowOpacity: 0.35,
-    shadowRadius: 3,
+    shadowRadius: 2,
     shadowOffset: { width: 0, height: 1 },
   },
   dealerButtonText: {
     color: colors.bg,
-    fontSize: 11,
+    fontSize: 8,
     fontWeight: "800",
     letterSpacing: -0.3,
+  },
+  // Host crown — circular gold chip top-right. Mirrors the dealer button
+  // visually so the two corner chips feel like one system.
+  hostChip: {
+    position: "absolute",
+    top: -5,
+    right: -5,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: colors.gold,
+    borderWidth: 1.5,
+    borderColor: colors.bg,
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 2,
+    shadowColor: "#000",
+    shadowOpacity: 0.35,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
   },
 
   footer: {
@@ -619,79 +453,9 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   error: {
-    color: "#d07070",
+    color: colors.danger,
     marginBottom: 8,
     textAlign: "center",
     fontSize: 13,
-  },
-
-  // Seat context menu (long-press-app style)
-  menuBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.5)",
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 40,
-  },
-  menuCard: {
-    width: "100%",
-    backgroundColor: "rgba(20,35,27,0.96)",
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: "rgba(201,169,97,0.2)",
-    paddingVertical: 16,
-    paddingHorizontal: 14,
-    gap: 8,
-  },
-  menuTitle: {
-    color: colors.text,
-    fontSize: 16,
-    fontWeight: "600",
-    textAlign: "center",
-    paddingVertical: 10,
-  },
-  menuItem: {
-    backgroundColor: "rgba(0,0,0,0.35)",
-    borderRadius: 18,
-    paddingVertical: 16,
-    alignItems: "center",
-  },
-  menuItemText: {
-    color: colors.text,
-    fontSize: 16,
-    fontWeight: "500",
-  },
-  menuItemTextDanger: {
-    color: colors.danger,
-  },
-
-  // Swap-mode banner
-  swapBanner: {
-    position: "absolute",
-    left: 16,
-    right: 16,
-    bottom: 24,
-    backgroundColor: "rgba(20,35,27,0.96)",
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: colors.hairStrong,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
-  },
-  swapBannerText: {
-    flex: 1,
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: "500",
-  },
-  swapBannerCancel: {
-    color: colors.gold,
-    fontSize: 13,
-    fontWeight: "700",
-    letterSpacing: 0.2,
   },
 });

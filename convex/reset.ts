@@ -10,9 +10,8 @@ export const clearAllData = internalMutation({
   handler: async (ctx) => {
     const tableNames = [
       "users",
-      "tables",
+      "games",
       "seats",
-      "transactions",
       "hands",
       "actions",
       "handResults",

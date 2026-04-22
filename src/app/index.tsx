@@ -1,35 +1,36 @@
 import { api } from "@/convex/_generated/api";
-import { useDisplayName } from "@/hooks/useDisplayName";
-import { useUserId } from "@/hooks/useUserId";
+import { useMe } from "@/hooks/useMe";
 import { colors, typography } from "@/theme";
-import { useConvex, useMutation } from "convex/react";
+import { useConvex, useConvexAuth, useMutation } from "convex/react";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 export default function Index() {
   const router = useRouter();
-  const userId = useUserId();
-  const displayName = useDisplayName();
-  const createTable = useMutation(api.tables.createTable);
+  const { isAuthenticated, isLoading: authLoading } = useConvexAuth();
+  const me = useMe();
+  const createGame = useMutation(api.games.createGame);
   const convex = useConvex();
   const [creatingTable, setCreatingTable] = useState(false);
   const [checkingForActiveTable, setCheckingForActiveTable] = useState(true);
 
-  // Uses convex.query rather than useQuery so we don't stay subscribed
+  // Resume an in-progress game if one exists. One-shot read so we don't
+  // stay subscribed.
   useEffect(() => {
-    if (!userId) {
+    if (authLoading) return;
+    if (!isAuthenticated) {
       setCheckingForActiveTable(false);
       return;
     }
     let cancelled = false;
-    convex.query(api.tables.getMyActiveTable, { userId }).then((result) => {
+    convex.query(api.games.getMyActiveGame).then((result) => {
       if (cancelled) return;
-      if (result?.table.status === "lobby") {
-        router.replace(`/table/${result.table.code}/lobby`);
-      } else if (result?.table.status === "active") {
-        router.replace(`/table/${result.table.code}/hand`);
+      if (result?.game.status === "lobby") {
+        router.replace(`/table/${result.game.code}/lobby`);
+      } else if (result?.game.status === "active") {
+        router.replace(`/table/${result.game.code}/hand`);
       } else {
         setCheckingForActiveTable(false);
       }
@@ -37,26 +38,36 @@ export default function Index() {
     return () => {
       cancelled = true;
     };
-  }, [userId, router, convex]);
+  }, [authLoading, isAuthenticated, router, convex]);
 
-  // Loading state: user, profile, or active-table check still pending.
-  if (userId === undefined || displayName === undefined || checkingForActiveTable) {
+
+  if (authLoading || me === undefined || checkingForActiveTable) {
+    // Logo-only landing — visually continuous with the native splash so the
+    // transition from launch to first screen doesn't blink.
     return (
       <SafeAreaView style={styles.loading}>
-        <ActivityIndicator color={colors.text} />
+        <Image
+          source={require("../../assets/images/icon.png")}
+          style={styles.loadingLogo}
+          resizeMode="contain"
+        />
       </SafeAreaView>
     );
   }
 
+  const displayName = me?.displayName ?? null;
+  const hour = new Date().getHours();
+  const timeOfDay = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
+
   async function handleStartGame() {
     if (creatingTable) return;
-    if (!userId || !displayName) {
+    if (!isAuthenticated || !displayName) {
       router.push({ pathname: "/onboarding", params: { next: "create" } });
       return;
     }
     setCreatingTable(true);
     try {
-      const { code } = await createTable({ userId });
+      const { code } = await createGame({});
       // Push (not replace) so home stays below lobby in the stack — lets
       // Cancel pop back with the correct left-to-right animation.
       router.push(`/table/${code}/lobby`);
@@ -66,7 +77,7 @@ export default function Index() {
   }
 
   function handleJoinGame() {
-    if (userId && displayName) router.push("/join");
+    if (isAuthenticated && displayName) router.push("/join");
     else router.push({ pathname: "/onboarding", params: { next: "/join" } });
   }
 
@@ -75,7 +86,7 @@ export default function Index() {
       {displayName ? (
         <>
           <View style={styles.greetBlock}>
-            <Text style={styles.greetLine}>Good evening,</Text>
+            <Text style={styles.greetLine}>Good {timeOfDay},</Text>
             <Pressable
               onPress={() => router.push("/onboarding")}
               hitSlop={12}
@@ -128,6 +139,12 @@ const styles = StyleSheet.create({
     backgroundColor: colors.bg,
     justifyContent: "center",
     alignItems: "center",
+  },
+  loadingLogo: {
+    // Matches the native splash `imageWidth: 360` in app.json so there's no
+    // jump in size when the splash hides and this screen takes over.
+    width: 360,
+    height: 360,
   },
   container: {
     flex: 1,

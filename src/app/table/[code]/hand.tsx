@@ -1,7 +1,9 @@
 import { api } from "@/convex/_generated/api";
 import { Doc, Id } from "@/convex/_generated/dataModel";
-import { useUserId } from "@/hooks/useUserId";
+import { useMe } from "@/hooks/useMe";
 import { colorHex, colors, typography } from "@/theme";
+import { MaterialCommunityIcons } from "@expo/vector-icons";
+import Slider from "@react-native-community/slider";
 import { useMutation, useQuery } from "convex/react";
 import * as Haptics from "expo-haptics";
 import { useKeepAwake } from "expo-keep-awake";
@@ -9,16 +11,16 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  Modal,
+  PanResponder,
   Pressable,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
+import Animated, { LinearTransition } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type SeatWithProfile = Doc<"seats"> & { displayName: string; color: string };
+type SeatWithProfile = Doc<"seats"> & { displayName: string };
 type Hand = Doc<"hands">;
 type Action = Doc<"actions">;
 
@@ -27,10 +29,10 @@ type Action = Doc<"actions">;
 // around clockwise from there.
 const TABLE_W = 340;
 const TABLE_H = 440;
-const SEAT_RX = 148;
+const SEAT_RX = 125;
 const SEAT_RY = 200;
-const PILL_W = 128;
-const PILL_H = 48;
+const PILL_W = 78;
+const PILL_H = 28;
 
 function seatPosition(index: number, total: number, meIndex: number) {
   const angle = ((index - meIndex) / total) * Math.PI * 2 + Math.PI / 2;
@@ -42,6 +44,54 @@ function seatPosition(index: number, total: number, meIndex: number) {
   };
 }
 
+const BET_H = 22;
+// The anchor is a fixed-width centering frame. The chip inside has no width
+// constraint and shrink-wraps to its content — so "1" looks tight, "999"
+// gets all the room it needs, both centered on the rail.
+const BET_ANCHOR_W = 60;
+
+// Community board: 5 slots that fill as streets progress.
+const COMMUNITY_CARD_W = 16;
+const COMMUNITY_CARD_H = 22;
+// Hole cards peek above each seat pill — sized to match the community cards
+// on the felt so all face-down cards read as the same deck.
+const HOLE_CARD_W = COMMUNITY_CARD_W;
+const HOLE_CARD_H = COMMUNITY_CARD_H;
+
+// Bet chip sits right on the oval's rail — its center lands on the oval
+// edge at the seat's angle, so chips visually "rest on" the table rim.
+const OVAL_RX = 105;
+const OVAL_RY = 180;
+
+// Anchor point (center) for the bet chip. The chip itself is wrapped in a
+// zero-size anchor View with flex-centered children so it shrink-wraps to
+// its own content (no trailing whitespace on short amounts).
+// Bet chip sits directly below its pill for top/side seats, and above the
+// pill (clearing the hole cards) for bottom-half seats. Ownership stays
+// unambiguous and nothing gets pushed off the tableArea bottom.
+function betPosition(index: number, total: number, meIndex: number) {
+  const angle = ((index - meIndex) / total) * Math.PI * 2 + Math.PI / 2;
+  const cx = TABLE_W / 2;
+  const cy = TABLE_H / 2;
+  const pillCx = cx + SEAT_RX * Math.cos(angle);
+  const pillCy = cy + SEAT_RY * Math.sin(angle);
+  const isBottomHalf = pillCy > cy;
+  const top = isBottomHalf
+    ? pillCy - PILL_H / 2 - (HOLE_CARD_H - 4) - BET_H - 4
+    : pillCy + PILL_H / 2 + 4;
+  return {
+    left: pillCx - BET_ANCHOR_W / 2,
+    top,
+  };
+}
+
+function communityCardCount(street: Hand["street"]): number {
+  if (street === "preflop") return 0;
+  if (street === "flop") return 3;
+  if (street === "turn") return 4;
+  return 5; // river, showdown, complete
+}
+
 // =============================================================================
 // Screen
 // =============================================================================
@@ -51,23 +101,28 @@ export default function HandScreen() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
   const code = (codeParam ?? "").toUpperCase();
-  const userId = useUserId();
+  const me = useMe();
+  const userId = me?._id;
 
-  const table = useQuery(api.tables.getByCode, { code });
+  const table = useQuery(api.games.getByCode, { code });
   const seats = useQuery(
-    api.tables.getSeatsWithProfile,
-    table ? { tableId: table._id } : "skip",
+    api.games.getSeatsWithProfile,
+    table ? { gameId: table._id } : "skip",
   );
   const handView = useQuery(
     api.hands.getHandView,
-    table ? { tableId: table._id } : "skip",
+    table ? { gameId: table._id } : "skip",
+  );
+  // Pot breakdown. Only multi-pot (i.e. with side pots) is interesting to
+  // display; the Total pill covers the common case.
+  const potStructure = useQuery(
+    api.hands.getPotStructure,
+    handView?.hand ? { handId: handView.hand._id } : "skip",
   );
 
   const startHand = useMutation(api.hands.startHand);
-  const undoLastAction = useMutation(api.hands.undoLastAction);
-  const [startError, setStartError] = useState<string | null>(null);
-  const [undoError, setUndoError] = useState<string | null>(null);
-  const [meMenuOpen, setMeMenuOpen] = useState(false);
+  const endGame = useMutation(api.games.endGame);
+  const [endError, setEndError] = useState<string | null>(null);
 
   // Auto-route on table state changes.
   useEffect(() => {
@@ -77,6 +132,25 @@ export default function HandScreen() {
       router.replace(`/table/${code}/lobby`);
     }
   }, [table?.status, code, router]);
+
+  // Auto-start first hand once we're on the hand screen. Host-only (the
+  // mutation is gated to host), so only the host's client fires this.
+  const isHost = !!userId && table?.hostUserId === userId;
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (
+      isHost &&
+      table?.status === "active" &&
+      table?.currentHandId === undefined &&
+      !startedRef.current
+    ) {
+      startedRef.current = true;
+      startHand({ gameId: table._id }).catch(() => {
+        // Probably < 2 seats with chips; reset so the host can try later.
+        startedRef.current = false;
+      });
+    }
+  }, [isHost, table?.status, table?.currentHandId, table?._id, startHand]);
 
   // Haptic on "your turn" arrival and on hand completion.
   const lastToActRef = useRef<number | undefined>(undefined);
@@ -120,31 +194,38 @@ export default function HandScreen() {
     );
   }
 
-  const isHost = table.hostUserId === userId;
   const mySeat = seats.find((s) => s.userId === userId);
   const hand = handView?.hand;
   const actions = handView?.actions ?? [];
-  const result = handView?.result;
 
-  async function handleStartHand() {
-    setStartError(null);
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
-    try {
-      await startHand({ userId: userId!, tableId: table!._id });
-    } catch (e) {
-      setStartError(e instanceof Error ? e.message : "Failed to start hand");
+  // Per-seat chips put in on the CURRENT betting street. Cleared when the
+  // street advances (actions from prior streets don't match) — mirrors what
+  // live tables do when chips get swept into the pot between streets.
+  const committedByStreet = new Map<Id<"seats">, number>();
+  if (
+    hand &&
+    (hand.street === "preflop" ||
+      hand.street === "flop" ||
+      hand.street === "turn" ||
+      hand.street === "river")
+  ) {
+    for (const a of actions) {
+      if (a.street !== hand.street) continue;
+      committedByStreet.set(
+        a.seatId,
+        (committedByStreet.get(a.seatId) ?? 0) + a.amount,
+      );
     }
   }
 
-  async function handleUndo() {
-    setUndoError(null);
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(
-      () => {},
-    );
+  async function handleEndGame() {
+    setEndError(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     try {
-      await undoLastAction({ userId: userId!, tableId: table!._id });
+      await endGame({ gameId: table!._id });
+      router.replace(`/table/${code}/settle`);
     } catch (e) {
-      setUndoError(e instanceof Error ? e.message : "Undo failed");
+      setEndError(e instanceof Error ? e.message : "Failed to end game");
     }
   }
 
@@ -153,33 +234,10 @@ export default function HandScreen() {
     seats.findIndex((s) => s.userId === userId),
   );
   const handNumber = hand?.handNumber;
-  // SB/BB seats come from the posted-blind actions — empty until the first
-  // hand's blinds post.
-  const sbSeatId = actions.find(
-    (a) => a.type === "post_sb" && !a.undone,
-  )?.seatId;
-  const bbSeatId = actions.find(
-    (a) => a.type === "post_bb" && !a.undone,
-  )?.seatId;
   const streetText = hand ? streetLabel(hand) : "Between hands";
-  const toActSeat =
-    hand?.toActSeatIndex !== undefined
-      ? seats.find((s) => s.seatIndex === hand.toActSeatIndex)
-      : undefined;
-  const actionText =
-    !hand || hand.voided
-      ? "Waiting for host to deal"
-      : hand.street === "complete"
-      ? "Hand complete"
-      : hand.street === "showdown"
-      ? "Showdown"
-      : mySeat && hand.toActSeatIndex === mySeat.seatIndex
-      ? "Your turn"
-      : `Waiting on ${toActSeat?.displayName ?? "…"}`;
 
   return (
     <SafeAreaView style={styles.container} edges={["top", "bottom"]}>
-      {/* Top bar */}
       <View style={styles.topBar}>
         <View>
           <Text style={styles.topKicker}>
@@ -190,40 +248,83 @@ export default function HandScreen() {
             {table.smallBlind}/{table.bigBlind} · {table.code}
           </Text>
         </View>
-        <View style={styles.topBarRight}>
-          <Pressable onPress={() => setMeMenuOpen(true)} hitSlop={8}>
-            <Text style={styles.topMenuBtn}>Me</Text>
+        {isHost ? (
+          <Pressable onPress={handleEndGame} hitSlop={8}>
+            <Text style={styles.endGameBtn}>End</Text>
           </Pressable>
-          {isHost ? (
-            <Pressable
-              onPress={() => router.push(`/table/${code}/settings`)}
-              style={styles.topMenuIcon}
-              hitSlop={8}
-            >
-              <Text style={styles.topMenuIconText}>≡</Text>
-            </Pressable>
-          ) : null}
-        </View>
+        ) : null}
       </View>
 
-      {isHost && hand && !hand.voided && hand.street !== "complete" ? (
-        <View style={styles.undoBar}>
-          <Pressable onPress={handleUndo} hitSlop={8}>
-            <Text style={styles.undoBarText}>Undo last action</Text>
-          </Pressable>
-          {undoError ? <Text style={styles.errorInline}>{undoError}</Text> : null}
-        </View>
-      ) : null}
+      {endError ? <Text style={styles.errorInline}>{endError}</Text> : null}
 
-      {/* Oval table with seats around it and pot in the center */}
       <View style={styles.tableWrap}>
-        <View style={styles.tableArea}>
+        <Animated.View style={styles.tableArea} layout={LinearTransition}>
           <View style={styles.oval} />
           <View style={styles.potCenter}>
-            <Text style={styles.potKicker}>Pot</Text>
-            <Text style={styles.potValue}>{hand?.pot ?? 0}</Text>
-            <Text style={styles.actionText}>{actionText}</Text>
+            <View style={styles.potCard}>
+              <Text style={styles.potCardText}>
+                Total: {(hand?.pot ?? 0) / table.bigBlind}
+              </Text>
+            </View>
+            {potStructure && potStructure.pots.length > 1
+              ? potStructure.pots.map((pot, i) => (
+                  <View key={pot.index} style={styles.subPotCard}>
+                    <Text style={styles.subPotText}>
+                      {i === 0 ? "Main pot" : "Side pot"}:{" "}
+                      {pot.amount / table.bigBlind}
+                    </Text>
+                  </View>
+                ))
+              : null}
+            <View style={styles.cardRow}>
+              {[0, 1, 2, 3, 4].map((i) => {
+                const revealed =
+                  i < communityCardCount(hand?.street ?? "preflop");
+                return (
+                  <View
+                    key={i}
+                    style={revealed ? styles.cardBack : styles.cardSlot}
+                  />
+                );
+              })}
+            </View>
+            <Text style={styles.streetLabel}>
+              {streetText.toUpperCase()}
+            </Text>
           </View>
+          {/* Hole cards behind active seats, rendered before pills so the
+              pill overlaps the bottom half of the cards. Skipped for folded
+              and busted-inactive seats (both are out of the hand). */}
+          {hand && hand.street !== "complete"
+            ? seats.map((seat, i) => {
+                const isFoldedSeat = actions.some(
+                  (a) => a.type === "fold" && a.seatId === seat._id,
+                );
+                if (isFoldedSeat || seat.status === "inactive") return null;
+                const pos = seatPosition(i, seats.length, meIndex);
+                // Cards sit above the pill, with only ~4px tucked behind the
+                // top edge so most of each card reads clearly. Two cards are
+                // fanned 8° apart with a partial overlap for a "fanned hand"
+                // look. Centered horizontally over the pill.
+                const HOLE_CARDS_W = HOLE_CARD_W + 14; // fan spread
+                return (
+                  <View
+                    key={`hole-${seat._id}`}
+                    style={[
+                      styles.holeCards,
+                      {
+                        width: HOLE_CARDS_W,
+                        left: pos.left + PILL_W / 2 - HOLE_CARDS_W / 2,
+                        top: pos.top - HOLE_CARD_H + 4,
+                      },
+                    ]}
+                  >
+                    <View style={[styles.holeCard, styles.holeCardLeft]} />
+                    <View style={[styles.holeCard, styles.holeCardRight]} />
+                  </View>
+                );
+              })
+            : null}
           {seats.map((seat, i) => (
             <HandSeatPill
               key={seat._id}
@@ -236,52 +337,59 @@ export default function HandScreen() {
                   : seat.seatIndex ===
                     (table.dealerSeatIndex < 0 ? 0 : table.dealerSeatIndex)
               }
-              isSB={seat._id === sbSeatId}
-              isBB={seat._id === bbSeatId}
               isToAct={
                 hand?.toActSeatIndex !== undefined &&
                 hand.toActSeatIndex === seat.seatIndex
               }
-              isFolded={actions.some(
-                (a) => !a.undone && a.type === "fold" && a.seatId === seat._id,
-              )}
+              isFolded={
+                seat.status === "inactive" ||
+                actions.some(
+                  (a) => a.type === "fold" && a.seatId === seat._id,
+                )
+              }
               bigBlind={table.bigBlind}
               position={seatPosition(i, seats.length, meIndex)}
             />
           ))}
-        </View>
+          {seats.map((seat, i) => {
+            const amount = committedByStreet.get(seat._id) ?? 0;
+            if (amount === 0) return null;
+            return (
+              <View
+                key={`bet-${seat._id}`}
+                style={[
+                  styles.betChipAnchor,
+                  betPosition(i, seats.length, meIndex),
+                ]}
+                pointerEvents="none"
+              >
+                <View style={styles.betChip}>
+                  <MaterialCommunityIcons
+                    name="poker-chip"
+                    size={11}
+                    color={colors.gold}
+                  />
+                  <Text style={styles.betChipText}>{amount}</Text>
+                </View>
+              </View>
+            );
+          })}
+        </Animated.View>
       </View>
-
-      {startError ? <Text style={styles.errorInline}>{startError}</Text> : null}
 
       <ActionDock
         table={table}
         hand={hand ?? null}
         actions={actions}
-        result={result ?? null}
         seats={seats}
         mySeat={mySeat ?? null}
-        isHost={isHost}
-        userId={userId}
-        onStartHand={handleStartHand}
-      />
-
-      <MeMenu
-        open={meMenuOpen}
-        onClose={() => setMeMenuOpen(false)}
-        mySeat={mySeat ?? null}
-        tableId={table._id}
-        userId={userId}
-        isHost={isHost}
       />
     </SafeAreaView>
   );
 }
 
 // =============================================================================
-// HandSeatPill — seat rendering used on the oval table during a hand. Shows
-// the "B" button on the dealer, a gold border on your seat, a subtle gold
-// glow when it's their turn, and fades folded seats.
+// HandSeatPill
 // =============================================================================
 
 function HandSeatPill({
@@ -289,8 +397,6 @@ function HandSeatPill({
   isHostSeat,
   isMe,
   isDealer,
-  isSB,
-  isBB,
   isToAct,
   isFolded,
   bigBlind,
@@ -300,8 +406,6 @@ function HandSeatPill({
   isHostSeat: boolean;
   isMe: boolean;
   isDealer: boolean;
-  isSB: boolean;
-  isBB: boolean;
   isToAct: boolean;
   isFolded: boolean;
   bigBlind: number;
@@ -312,21 +416,18 @@ function HandSeatPill({
       <View
         style={[
           styles.handSeatPill,
-          isMe && styles.handSeatPillMe,
           isToAct && styles.handSeatPillToAct,
           isFolded && styles.handSeatPillFolded,
         ]}
       >
+        {isHostSeat ? (
+          <View style={styles.handHostChip}>
+            <MaterialCommunityIcons name="crown" size={9} color={colors.bg} />
+          </View>
+        ) : null}
         {isDealer ? (
           <View style={styles.handDealerButton}>
             <Text style={styles.handDealerButtonText}>B</Text>
-          </View>
-        ) : null}
-        {isSB || isBB ? (
-          <View style={styles.handPositionBadge}>
-            <Text style={styles.handPositionBadgeText}>
-              {isSB ? "SB" : "BB"}
-            </Text>
           </View>
         ) : null}
         <View
@@ -339,236 +440,123 @@ function HandSeatPill({
             {seat.displayName.slice(0, 1).toUpperCase()}
           </Text>
         </View>
-        <View style={styles.handSeatInfo}>
-          <Text style={styles.handSeatName} numberOfLines={1}>
-            {isMe ? "Me" : seat.displayName}
-            {isHostSeat ? (
-              <Text style={styles.handSeatBadge}>  HOST</Text>
-            ) : null}
-          </Text>
+        <View style={styles.handSeatStackRow}>
           <Text style={styles.handSeatStack} numberOfLines={1}>
-            {`${seat.chipStack / bigBlind} BB`}
+            {seat.chipStack / bigBlind}
           </Text>
         </View>
       </View>
-      {isFolded ? <Text style={styles.handFoldedLabel}>FOLDED</Text> : null}
     </View>
   );
 }
 
 // =============================================================================
-// MeMenu — sit out / sit in / cash out for the current player
-// =============================================================================
-
-function MeMenu({
-  open,
-  onClose,
-  mySeat,
-  tableId,
-  userId,
-  isHost,
-}: {
-  open: boolean;
-  onClose: () => void;
-  mySeat: SeatWithProfile | null;
-  tableId: Id<"tables">;
-  userId: Id<"users">;
-  isHost: boolean;
-}) {
-  const router = useRouter();
-  const sitOut = useMutation(api.tables.sitOut);
-  const sitIn = useMutation(api.tables.sitIn);
-  const cashOut = useMutation(api.tables.cashOut);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  if (!open || !mySeat) return null;
-
-  async function run<T>(fn: () => Promise<T>, after?: () => void) {
-    setBusy(true);
-    setError(null);
-    try {
-      await fn();
-      onClose();
-      after?.();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Modal animationType="fade" transparent visible onRequestClose={onClose}>
-      <View style={styles.modalBackdrop}>
-        <View style={styles.modalCard}>
-          <Text style={styles.modalTitle}>You · {mySeat.chipStack} chips</Text>
-
-          {mySeat.status === "active" ? (
-            <Pressable
-              onPress={() => run(() => sitOut({ userId, tableId }))}
-              disabled={busy}
-              style={[styles.menuItem, busy && styles.ctaDisabled]}
-            >
-              <Text style={styles.menuItemText}>Sit out next hand</Text>
-            </Pressable>
-          ) : null}
-
-          {mySeat.status === "sitting_out" ? (
-            <Pressable
-              onPress={() => run(() => sitIn({ userId, tableId }))}
-              disabled={busy}
-              style={[styles.menuItem, busy && styles.ctaDisabled]}
-            >
-              <Text style={styles.menuItemText}>Sit back in</Text>
-            </Pressable>
-          ) : null}
-
-          {mySeat.status !== "cashed_out" && mySeat.status !== "kicked" ? (
-            <Pressable
-              onPress={() =>
-                run(
-                  () => cashOut({ userId, tableId }),
-                  () => router.replace("/"),
-                )
-              }
-              disabled={busy || isHost}
-              style={[
-                styles.menuItem,
-                styles.menuItemDanger,
-                (busy || isHost) && styles.ctaDisabled,
-              ]}
-            >
-              <Text style={[styles.menuItemText, { color: colors.danger }]}>
-                Cash out & leave
-              </Text>
-              {isHost ? (
-                <Text style={styles.muted}>Transfer host first</Text>
-              ) : null}
-            </Pressable>
-          ) : null}
-
-          {error ? <Text style={styles.error}>{error}</Text> : null}
-
-          <Pressable
-            onPress={onClose}
-            style={[styles.menuItem, { backgroundColor: "transparent" }]}
-          >
-            <Text style={[styles.menuItemText, { color: colors.mute }]}>
-              Close
-            </Text>
-          </Pressable>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-// =============================================================================
-// Action dock — bottom area: action buttons / showdown picker / next-hand
+// Action dock
 // =============================================================================
 
 function ActionDock({
   table,
   hand,
   actions,
-  result,
   seats,
   mySeat,
-  isHost,
-  userId,
-  onStartHand,
 }: {
-  table: Doc<"tables">;
+  table: Doc<"games">;
   hand: Hand | null;
   actions: Action[];
-  result: Doc<"handResults"> | null;
   seats: SeatWithProfile[];
   mySeat: SeatWithProfile | null;
-  isHost: boolean;
-  userId: Id<"users">;
-  onStartHand: () => void;
 }) {
-  // No hand in progress — host can deal, others wait.
-  if (!hand || hand.street === "complete" || hand.voided) {
+  // No hand in progress — waiting for auto-start.
+  if (!hand || hand.street === "complete") {
     return (
       <View style={styles.dock}>
-        {isHost ? (
-          <Pressable onPress={onStartHand} style={styles.cta}>
-            <Text style={styles.ctaText}>Deal next hand</Text>
-          </Pressable>
-        ) : (
-          <Text style={styles.dockMuted}>Waiting for host to deal…</Text>
-        )}
+        <Text style={styles.dockMuted}>Waiting for next hand…</Text>
       </View>
     );
   }
 
   // Showdown — anyone can pick the winner.
   if (hand.street === "showdown") {
+    return <ShowdownDock hand={hand} seats={seats} />;
+  }
+
+  const toActSeat =
+    hand.toActSeatIndex !== undefined
+      ? seats.find((s) => s.seatIndex === hand.toActSeatIndex)
+      : undefined;
+  if (!toActSeat) {
     return (
-      <ShowdownDock
-        hand={hand}
-        seats={seats}
-        userId={userId}
-      />
+      <View style={styles.dock}>
+        <Text style={styles.dockMuted}>Waiting for next hand…</Text>
+      </View>
     );
   }
 
-  // My turn? Show action buttons.
-  if (mySeat && hand.toActSeatIndex === mySeat.seatIndex) {
-    return (
-      <MyTurnDock
-        table={table}
-        hand={hand}
-        actions={actions}
-        mySeat={mySeat}
-        userId={userId}
-      />
-    );
-  }
+  const isMyTurn = !!mySeat && hand.toActSeatIndex === mySeat.seatIndex;
 
-  // Otherwise — waiting on someone.
-  const toAct = seats.find((s) => s.seatIndex === hand.toActSeatIndex);
   return (
-    <View style={styles.dock}>
-      <Text style={styles.dockMuted}>
-        Waiting on {toAct?.displayName ?? "…"}
-      </Text>
-    </View>
+    <TurnDock
+      table={table}
+      hand={hand}
+      actions={actions}
+      mySeat={mySeat}
+      toActSeat={toActSeat}
+      isMyTurn={isMyTurn}
+    />
   );
 }
 
 // -----------------------------------------------------------------------------
-// MyTurnDock
+// TurnDock
 // -----------------------------------------------------------------------------
 
-function MyTurnDock({
+function TurnDock({
   table,
   hand,
   actions,
   mySeat,
-  userId,
+  toActSeat,
+  isMyTurn,
 }: {
-  table: Doc<"tables">;
+  table: Doc<"games">;
   hand: Hand;
   actions: Action[];
-  mySeat: SeatWithProfile;
-  userId: Id<"users">;
+  mySeat: SeatWithProfile | null;
+  toActSeat: SeatWithProfile;
+  isMyTurn: boolean;
 }) {
   const recordAction = useMutation(api.hands.recordAction);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [betModal, setBetModal] = useState<null | "bet" | "raise">(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  // Drag handle: swipe down on the header to collapse, swipe up to expand;
+  // a short press without movement toggles. Attached to a plain View —
+  // Pressable's own responder system would swallow the pan gesture.
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: (_, g) =>
+        Math.abs(g.dy) > 4 || Math.abs(g.dx) > 4,
+      onPanResponderRelease: (_, g) => {
+        if (g.dy > 16) setCollapsed(true);
+        else if (g.dy < -16) setCollapsed(false);
+        else if (Math.abs(g.dy) < 6 && Math.abs(g.dx) < 6) {
+          setCollapsed((c) => !c);
+        }
+      },
+    }),
+  ).current;
 
   const myStreetCommit = useMemo(() => {
+    if (!mySeat) return 0;
     const street =
       hand.street === "showdown" || hand.street === "complete"
         ? "river"
         : hand.street;
     let total = 0;
     for (const a of actions) {
-      if (a.undone) continue;
       if (a.street !== street) continue;
       if (a.seatId !== mySeat._id) continue;
       total += a.amount;
@@ -576,27 +564,111 @@ function MyTurnDock({
     return total;
   }, [actions, hand, mySeat]);
 
+  // Reopening rule: if a short all-in happened after the caller already
+  // acted, the caller can only call or fold — no re-raise.
+  const myActionClosed = useMemo(() => {
+    if (!mySeat) return false;
+    const reopenSeq = hand.lastFullRaiseSequence;
+    if (reopenSeq === undefined) return false;
+    const street =
+      hand.street === "showdown" || hand.street === "complete"
+        ? "river"
+        : hand.street;
+    return actions.some(
+      (a) =>
+        a.seatId === mySeat._id &&
+        a.street === street &&
+        a.sequence >= reopenSeq &&
+        a.type !== "post_sb" &&
+        a.type !== "post_bb",
+    );
+  }, [actions, hand, mySeat]);
+
+  // A "live" opponent is another participant who is still eligible to bet
+  // (not folded, not already all-in). If nobody matches that, any extra
+  // chips we put in just spawn a side pot only we contribute to — pointless
+  // aggression.
+  const hasLiveOpponent = useMemo(() => {
+    if (!mySeat) return false;
+    const participants = new Set<Id<"seats">>();
+    const folded = new Set<Id<"seats">>();
+    const allIn = new Set<Id<"seats">>();
+    for (const a of actions) {
+      participants.add(a.seatId);
+      if (a.type === "fold") folded.add(a.seatId);
+      if (a.type === "all_in") allIn.add(a.seatId);
+    }
+    for (const sid of participants) {
+      if (sid === mySeat._id) continue;
+      if (folded.has(sid)) continue;
+      if (allIn.has(sid)) continue;
+      return true;
+    }
+    return false;
+  }, [actions, mySeat]);
+
   const callAmount = Math.max(0, hand.currentBet - myStreetCommit);
-  const canCheck = hand.currentBet === myStreetCommit;
-  const canCall = !canCheck && callAmount > 0;
-  const canBet = hand.currentBet === 0 && mySeat.chipStack >= table.bigBlind;
+  const canCheck = !!mySeat && hand.currentBet === myStreetCommit;
+  const canCall = !!mySeat && !canCheck && callAmount > 0;
+  // Aggression (bet / raise / short all-in) is only meaningful when at least
+  // one opponent can still match it. It's also blocked when the player's
+  // action is closed by the short-all-in reopening rule.
+  const canAggress =
+    !!mySeat &&
+    !myActionClosed &&
+    hasLiveOpponent &&
+    mySeat.chipStack > 0;
+  const canBet =
+    canAggress && hand.currentBet === 0 && mySeat!.chipStack >= table.bigBlind;
+  // A legal raise additionally needs the stack to reach (currentBet +
+  // minRaise). A player short of that can only all-in, which still requires
+  // a live opponent to be meaningful (covered by canAggress).
   const canRaise =
-    hand.currentBet > 0 && mySeat.chipStack > callAmount;
+    canAggress &&
+    hand.currentBet > 0 &&
+    mySeat!.chipStack > callAmount &&
+    myStreetCommit + mySeat!.chipStack >= hand.currentBet + hand.minRaise;
+  const canBetOrRaise = canBet || canRaise;
+
+  // Bet-sizing state for the inline slider + quick buttons.
+  const minTarget = canBet ? table.bigBlind : hand.currentBet + hand.minRaise;
+  const maxTarget = mySeat ? myStreetCommit + mySeat.chipStack : minTarget;
+  const clampedMin = Math.min(minTarget, maxTarget);
+  const [target, setTarget] = useState(clampedMin);
+
+  useEffect(() => {
+    setTarget(clampedMin);
+  }, [hand._id, hand.street, hand.currentBet, clampedMin]);
+
+  const roundToHalf = (v: number) => Math.round(v * 2) / 2;
+  const clamp = (v: number) =>
+    Math.max(clampedMin, Math.min(maxTarget, roundToHalf(v)));
+  const multiplierBase = hand.currentBet > 0 ? hand.currentBet : table.bigBlind;
+  const potTarget = (fraction: number): number => {
+    const P = hand.pot;
+    const B = hand.currentBet;
+    const C = myStreetCommit;
+    if (B === 0) return P * fraction;
+    return B + fraction * (P + B - C);
+  };
+  const isPreflop = hand.street === "preflop";
 
   async function fire(
     type: "check" | "call" | "fold" | "all_in" | "bet" | "raise",
-    amount?: number,
+    opts?: { amount?: number; onBehalfOf?: Id<"seats"> },
   ) {
     setError(null);
     setBusy(true);
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     try {
       await recordAction({
-        userId,
         handId: hand._id,
         type,
-        amount,
+        amount: opts?.amount,
+        onBehalfOf: opts?.onBehalfOf,
       });
+      // Stays open by default — user controls collapse with a tap or a
+      // swipe-down on the header.
     } catch (e) {
       setError(e instanceof Error ? e.message : "Action failed");
     } finally {
@@ -604,83 +676,198 @@ function MyTurnDock({
     }
   }
 
+  const raiseLabel = canBet
+    ? `Bet ${target}`
+    : canRaise
+    ? `Raise to ${target}`
+    : "All-in";
+
+  const turnLabel = isMyTurn ? "Your turn" : `${toActSeat.displayName}'s turn`;
+
   return (
-    <View style={styles.myTurnDock}>
-      <View style={styles.myTurnHeader}>
-        <Text style={styles.myTurnKicker}>Your turn</Text>
-        {hand.currentBet > 0 && callAmount > 0 ? (
-          <Text style={styles.myTurnCall}>
-            To call <Text style={styles.myTurnCallAmt}>{callAmount}</Text>
-          </Text>
-        ) : (
-          <Text style={styles.myTurnCall}>
-            Stack <Text style={styles.myTurnCallAmt}>{mySeat.chipStack}</Text>
-          </Text>
-        )}
+    <Animated.View style={styles.turnDock} layout={LinearTransition}>
+      <View style={styles.turnDockHeader} {...panResponder.panHandlers}>
+        <View style={styles.dragHandle} />
+        <Text style={styles.turnDockHeaderText}>{turnLabel}</Text>
       </View>
 
-      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {!collapsed ? (
+        <View style={styles.turnDockBody}>
+          {error ? <Text style={styles.error}>{error}</Text> : null}
 
-      <View style={styles.actionRow}>
-        <ActionButton
-          label="Fold"
-          tone="fold"
-          onPress={() => fire("fold")}
-          disabled={busy}
-        />
-        {canCheck ? (
-          <ActionButton
-            label="Check"
-            tone="call"
-            onPress={() => fire("check")}
-            disabled={busy}
-          />
-        ) : (
-          <ActionButton
-            label={`Call ${callAmount}`}
-            tone="call"
-            onPress={() => fire("call")}
-            disabled={busy || !canCall}
-          />
-        )}
-        {canBet ? (
-          <ActionButton
-            label="Bet"
-            tone="raise"
-            onPress={() => setBetModal("bet")}
-            disabled={busy}
-          />
-        ) : canRaise ? (
-          <ActionButton
-            label="Raise"
-            tone="raise"
-            onPress={() => setBetModal("raise")}
-            disabled={busy}
-          />
-        ) : (
-          <ActionButton
-            label="All-in"
-            tone="raise"
-            onPress={() => fire("all_in")}
-            disabled={busy || mySeat.chipStack === 0}
-          />
-        )}
-      </View>
+          {isMyTurn && mySeat ? (
+            <>
+              <View style={styles.actionRow}>
+                {!canCheck ? (
+                  <ActionButton
+                    label="Fold"
+                    tone="fold"
+                    onPress={() => fire("fold")}
+                    disabled={busy}
+                  />
+                ) : null}
+                {canCheck ? (
+                  <ActionButton
+                    label="Check"
+                    tone="call"
+                    onPress={() => fire("check")}
+                    disabled={busy}
+                  />
+                ) : (
+                  <ActionButton
+                    label={`Call ${callAmount}`}
+                    tone="call"
+                    onPress={() => fire("call")}
+                    disabled={busy || !canCall}
+                  />
+                )}
+                {canAggress ? (
+                  <ActionButton
+                    label={raiseLabel}
+                    tone="raise"
+                    onPress={() => {
+                      // Short all-ins (below min-raise) must go through
+                      // "all_in" since the server rejects "raise" amounts
+                      // under minRaise.
+                      if (canBetOrRaise && target >= maxTarget) fire("all_in");
+                      else if (canBet) fire("bet", { amount: target });
+                      else if (canRaise) fire("raise", { amount: target });
+                      else fire("all_in");
+                    }}
+                    disabled={busy}
+                  />
+                ) : null}
+              </View>
 
-      <BetModal
-        kind={betModal}
-        onClose={() => setBetModal(null)}
-        bigBlind={table.bigBlind}
-        currentBet={hand.currentBet}
-        minRaise={hand.minRaise}
-        myStack={mySeat.chipStack}
-        myStreetCommit={myStreetCommit}
-        onConfirm={async (target) => {
-          setBetModal(null);
-          await fire(betModal === "bet" ? "bet" : "raise", target);
-        }}
-      />
-    </View>
+              {canBetOrRaise && clampedMin < maxTarget ? (
+                <>
+                  <View style={styles.sliderRow}>
+                    <Pressable
+                      onPress={() =>
+                        setTarget((t) => clamp(t - table.smallBlind))
+                      }
+                      disabled={busy}
+                      style={({ pressed }) => [
+                        styles.stepBtn,
+                        pressed && styles.btnPressed,
+                      ]}
+                      hitSlop={4}
+                    >
+                      <Text style={styles.stepBtnText}>−</Text>
+                    </Pressable>
+                    <Slider
+                      style={styles.slider}
+                      minimumValue={clampedMin}
+                      maximumValue={maxTarget}
+                      step={table.bigBlind}
+                      value={target}
+                      onValueChange={(v) => setTarget(Math.round(v))}
+                      minimumTrackTintColor={colors.gold}
+                      maximumTrackTintColor={colors.hairStrong}
+                      thumbTintColor={colors.gold}
+                      disabled={busy}
+                    />
+                    <Pressable
+                      onPress={() =>
+                        setTarget((t) => clamp(t + table.smallBlind))
+                      }
+                      disabled={busy}
+                      style={({ pressed }) => [
+                        styles.stepBtn,
+                        pressed && styles.btnPressed,
+                      ]}
+                      hitSlop={4}
+                    >
+                      <Text style={styles.stepBtnText}>+</Text>
+                    </Pressable>
+                  </View>
+                  <View style={styles.quickRow}>
+                    {isPreflop ? (
+                      <>
+                        <QuickButton
+                          label="x3"
+                          onPress={() =>
+                            setTarget(clamp(multiplierBase * 3))
+                          }
+                          disabled={busy}
+                        />
+                        <QuickButton
+                          label="x5"
+                          onPress={() =>
+                            setTarget(clamp(multiplierBase * 5))
+                          }
+                          disabled={busy}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <QuickButton
+                          label="½ Pot"
+                          onPress={() => setTarget(clamp(potTarget(0.5)))}
+                          disabled={busy}
+                        />
+                        <QuickButton
+                          label="¾ Pot"
+                          onPress={() => setTarget(clamp(potTarget(0.75)))}
+                          disabled={busy}
+                        />
+                      </>
+                    )}
+                    <QuickButton
+                      label="Pot"
+                      onPress={() => setTarget(clamp(potTarget(1)))}
+                      disabled={busy}
+                    />
+                    <QuickButton
+                      label="All in"
+                      onPress={() => setTarget(maxTarget)}
+                      disabled={busy}
+                    />
+                  </View>
+                </>
+              ) : null}
+            </>
+          ) : (
+            // Not my turn — offer the AFK fold. Useful when a player is in
+            // the bathroom / away from the device; anyone at the table can
+            // fold for them. Wrapped in an actionRow so the button's flex:1
+            // stretches horizontally the way it does beside other buttons.
+            <View style={styles.actionRow}>
+              <ActionButton
+                label="Fold"
+                tone="fold"
+                onPress={() => fire("fold", { onBehalfOf: toActSeat._id })}
+                disabled={busy || !mySeat}
+              />
+            </View>
+          )}
+        </View>
+      ) : null}
+    </Animated.View>
+  );
+}
+
+function QuickButton({
+  label,
+  onPress,
+  disabled,
+}: {
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      style={({ pressed }) => [
+        styles.quickBtn,
+        pressed && styles.btnPressed,
+        disabled && styles.ctaDisabled,
+      ]}
+    >
+      <Text style={styles.quickBtnText}>{label}</Text>
+    </Pressable>
   );
 }
 
@@ -695,23 +882,33 @@ function ActionButton({
   tone: "fold" | "call" | "raise";
   disabled?: boolean;
 }) {
-  const style =
-    tone === "fold"
-      ? styles.actionBtnFold
-      : tone === "call"
-      ? styles.actionBtnCall
-      : styles.actionBtnRaise;
-  const textStyle =
-    tone === "fold"
-      ? styles.actionBtnTextFold
-      : tone === "call"
-      ? styles.actionBtnTextCall
-      : styles.actionBtnTextRaise;
+  // When disabled, drop the tone-specific accent (red/green/gold) and fall
+  // back to a neutral treatment so the button reads as "off" rather than
+  // "tinted but dim." Opacity alone isn't enough — a 40% red button still
+  // looks like a red button.
+  const toneStyle = disabled
+    ? styles.actionBtnInactive
+    : tone === "fold"
+    ? styles.actionBtnFold
+    : tone === "call"
+    ? styles.actionBtnCall
+    : styles.actionBtnRaise;
+  const textStyle = disabled
+    ? styles.actionBtnTextInactive
+    : tone === "fold"
+    ? styles.actionBtnTextFold
+    : tone === "call"
+    ? styles.actionBtnTextCall
+    : styles.actionBtnTextRaise;
   return (
     <Pressable
       onPress={onPress}
       disabled={disabled}
-      style={[styles.actionBtn, style, disabled && styles.ctaDisabled]}
+      style={({ pressed }) => [
+        styles.actionBtn,
+        toneStyle,
+        pressed && styles.btnPressed,
+      ]}
     >
       <Text style={textStyle}>{label}</Text>
     </Pressable>
@@ -719,169 +916,61 @@ function ActionButton({
 }
 
 // -----------------------------------------------------------------------------
-// BetModal — numeric input for bet/raise target
-// -----------------------------------------------------------------------------
-
-function BetModal({
-  kind,
-  onClose,
-  onConfirm,
-  bigBlind,
-  currentBet,
-  minRaise,
-  myStack,
-  myStreetCommit,
-}: {
-  kind: "bet" | "raise" | null;
-  onClose: () => void;
-  onConfirm: (target: number) => void | Promise<void>;
-  bigBlind: number;
-  currentBet: number;
-  minRaise: number;
-  myStack: number;
-  myStreetCommit: number;
-}) {
-  const minTarget = kind === "bet" ? bigBlind : currentBet + minRaise;
-  const maxTarget = myStreetCommit + myStack;
-  const [target, setTarget] = useState(String(minTarget));
-
-  useEffect(() => {
-    setTarget(String(minTarget));
-  }, [minTarget, kind]);
-
-  if (!kind) return null;
-
-  const numeric = Number(target);
-  const valid =
-    Number.isInteger(numeric) && numeric >= minTarget && numeric <= maxTarget;
-
-  return (
-    <Modal animationType="fade" transparent visible onRequestClose={onClose}>
-      <View style={styles.modalBackdrop}>
-        <View style={styles.modalCard}>
-          <Text style={styles.modalTitle}>
-            {kind === "bet" ? "Bet" : "Raise to"}
-          </Text>
-          <Text style={styles.modalSubtitle}>
-            min {minTarget} · max {maxTarget}
-          </Text>
-          <TextInput
-            value={target}
-            onChangeText={setTarget}
-            keyboardType="number-pad"
-            style={styles.modalInput}
-            autoFocus
-          />
-          <View style={styles.modalActions}>
-            <Pressable onPress={onClose} style={[styles.modalButton, styles.modalCancel]}>
-              <Text style={[styles.modalButtonText, { color: colors.text }]}>
-                Cancel
-              </Text>
-            </Pressable>
-            <Pressable
-              onPress={() => valid && onConfirm(numeric)}
-              disabled={!valid}
-              style={[
-                styles.modalButton,
-                styles.modalConfirm,
-                !valid && styles.ctaDisabled,
-              ]}
-            >
-              <Text style={styles.modalButtonText}>Confirm</Text>
-            </Pressable>
-          </View>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-// -----------------------------------------------------------------------------
-// ShowdownDock — pick winner(s)
+// ShowdownDock
 // -----------------------------------------------------------------------------
 
 function ShowdownDock({
   hand,
   seats,
-  userId,
 }: {
   hand: Hand;
   seats: SeatWithProfile[];
-  userId: Id<"users">;
 }) {
-  const awardPot = useMutation(api.hands.awardPot);
+  const pickPotWinner = useMutation(api.hands.pickPotWinner);
   const potStructure = useQuery(api.hands.getPotStructure, { handId: hand._id });
 
-  // Per-pot picked winners, indexed by potIndex.
-  const [pickedByPot, setPickedByPot] = useState<
-    Record<number, Set<Id<"seats">>>
-  >({});
-  const [step, setStep] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   if (!potStructure) {
     return (
-      <View style={styles.dock}>
-        <Text style={styles.dockMuted}>Loading pots…</Text>
+      <View style={styles.turnDock}>
+        <View style={styles.turnDockHeader}>
+          <Text style={styles.turnDockHeaderText}>Loading pots…</Text>
+        </View>
       </View>
     );
   }
 
   const pots = potStructure.pots;
+  // Step is derived from server state so every client advances together as
+  // picks are made. hand.pendingAwards is appended to by pickPotWinner.
+  const step = hand.pendingAwards?.length ?? 0;
   const currentPot = pots[step];
-  const isLast = step === pots.length - 1;
 
-  function toggle(potIndex: number, seatId: Id<"seats">) {
-    setPickedByPot((cur) => {
-      const next = { ...cur };
-      const set = new Set(next[potIndex] ?? []);
-      if (set.has(seatId)) set.delete(seatId);
-      else set.add(seatId);
-      next[potIndex] = set;
-      return next;
-    });
-  }
-
-  function advance() {
-    if (!isLast) {
-      setStep((s) => s + 1);
-      return;
-    }
-    submit();
-  }
-
-  async function submit() {
+  async function pickWinner(seatId: Id<"seats">) {
+    if (busy || !currentPot) return;
     setError(null);
     setBusy(true);
     try {
-      const awards: { seatId: Id<"seats">; potIndex: number; amount: number }[] = [];
-      for (const pot of pots) {
-        const winners = Array.from(pickedByPot[pot.index] ?? []);
-        if (winners.length === 0) {
-          throw new Error(`Pot ${pot.index + 1} needs a winner`);
-        }
-        const base = Math.floor(pot.amount / winners.length);
-        const remainder = pot.amount - base * winners.length;
-        winners.forEach((seatId, i) => {
-          awards.push({
-            seatId,
-            potIndex: pot.index,
-            amount: i < remainder ? base + 1 : base,
-          });
-        });
-      }
-      await awardPot({ userId, handId: hand._id, awards });
+      await pickPotWinner({
+        handId: hand._id,
+        potIndex: currentPot.index,
+        seatId,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Award failed");
+    } finally {
       setBusy(false);
     }
   }
 
   if (!currentPot) {
     return (
-      <View style={styles.dock}>
-        <Text style={styles.dockMuted}>No pot to award.</Text>
+      <View style={styles.turnDock}>
+        <View style={styles.turnDockHeader}>
+          <Text style={styles.turnDockHeaderText}>No pot to award</Text>
+        </View>
       </View>
     );
   }
@@ -889,66 +978,56 @@ function ShowdownDock({
   const eligible = currentPot.eligibleSeatIds
     .map((id) => seats.find((s) => s._id === id))
     .filter((s): s is SeatWithProfile => !!s);
-  const picked = pickedByPot[currentPot.index] ?? new Set<Id<"seats">>();
-  const potLabel =
-    pots.length === 1
-      ? "Who won?"
-      : currentPot.isMain
-      ? `Main pot (${step + 1}/${pots.length})`
-      : `Side pot ${step + 1}/${pots.length}`;
+  const potLabel = step === 0 ? "Main Pot Winner" : "Side Pot Winner";
 
   return (
-    <View style={styles.dock}>
-      <Text style={styles.dockHeader}>
-        {potLabel} · {currentPot.amount} chips
-      </Text>
-      <View style={styles.showdownRow}>
-        {eligible.map((seat) => {
-          const isPicked = picked.has(seat._id);
-          return (
-            <Pressable
-              key={seat._id}
-              onPress={() => toggle(currentPot.index, seat._id)}
-              style={[
-                styles.showdownPill,
-                {
-                  backgroundColor: isPicked ? colorHex(seat.color) : colors.surface,
-                  borderColor: colorHex(seat.color),
-                },
-              ]}
-            >
-              <Text
-                style={[
-                  styles.showdownPillText,
-                  { color: isPicked ? colors.bg : colors.text },
+    <Animated.View style={styles.turnDock} layout={LinearTransition}>
+      <View style={styles.turnDockHeader}>
+        <Text style={styles.turnDockHeaderText}>{potLabel}</Text>
+      </View>
+      <View style={styles.turnDockBody}>
+        {error ? <Text style={styles.error}>{error}</Text> : null}
+        <View style={styles.showdownRow}>
+          {eligible.map((seat) => {
+            const seatColor = colorHex(seat.color);
+            return (
+              <Pressable
+                key={seat._id}
+                onPress={() => pickWinner(seat._id)}
+                disabled={busy}
+                style={({ pressed }) => [
+                  styles.actionBtn,
+                  {
+                    backgroundColor: rgba(seatColor, 0.1),
+                    borderColor: rgba(seatColor, 0.55),
+                    borderWidth: 1,
+                    flexDirection: "row",
+                    gap: 8,
+                    paddingHorizontal: 10,
+                  },
+                  pressed && styles.btnPressed,
+                  busy && styles.ctaDisabled,
                 ]}
               >
-                {seat.displayName}
-              </Text>
-            </Pressable>
-          );
-        })}
+                <Text style={styles.showdownName} numberOfLines={1}>
+                  {seat.displayName}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
       </View>
-      {error ? <Text style={styles.error}>{error}</Text> : null}
-      <Pressable
-        onPress={advance}
-        disabled={picked.size === 0 || busy}
-        style={[
-          styles.cta,
-          (picked.size === 0 || busy) && styles.ctaDisabled,
-          { marginTop: 8 },
-        ]}
-      >
-        <Text style={styles.ctaText}>
-          {isLast
-            ? picked.size > 1
-              ? `Split & award all`
-              : "Award all"
-            : "Next pot"}
-        </Text>
-      </Pressable>
-    </View>
+    </Animated.View>
   );
+}
+
+// Simple hex-to-rgba converter for dynamic seat-colored styling.
+function rgba(hex: string, alpha: number): string {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 // =============================================================================
@@ -977,14 +1056,13 @@ function streetLabel(hand: Hand): string {
 // =============================================================================
 
 const styles = StyleSheet.create({
-  // -------- Round 1 felt-palette shell --------
   topBar: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "flex-start",
     paddingHorizontal: 20,
     paddingTop: 8,
-    paddingBottom: 4,
+    paddingBottom: 24,
   },
   topKicker: {
     color: colors.gold,
@@ -1001,50 +1079,16 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     marginTop: 2,
   },
-  topBarRight: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 14,
-  },
-  topMenuBtn: {
-    color: colors.mute,
-    fontSize: 12,
+  endGameBtn: {
+    color: colors.danger,
+    fontSize: 13,
     fontWeight: "700",
-    letterSpacing: 0.8,
+    letterSpacing: 1,
     textTransform: "uppercase",
-  },
-  topMenuIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: colors.hairStrong,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.04)",
-  },
-  topMenuIconText: {
-    color: colors.text,
-    fontSize: 18,
-    lineHeight: 20,
-  },
-  undoBar: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    paddingTop: 4,
-    paddingBottom: 2,
-  },
-  undoBarText: {
-    color: colors.gold,
-    fontSize: 11,
-    fontWeight: "700",
-    letterSpacing: 0.6,
-    textTransform: "uppercase",
+    paddingVertical: 4,
   },
   errorInline: {
-    color: "#d07070",
+    color: colors.danger,
     fontSize: 12,
     textAlign: "center",
     paddingHorizontal: 24,
@@ -1061,51 +1105,129 @@ const styles = StyleSheet.create({
   },
   oval: {
     position: "absolute",
-    left: (TABLE_W - 240) / 2,
-    top: (TABLE_H - 340) / 2,
-    width: 240,
-    height: 340,
-    borderRadius: 170,
-    backgroundColor: "#1e3a2a",
+    left: (TABLE_W - 210) / 2,
+    top: (TABLE_H - 360) / 2,
+    width: 210,
+    height: 360,
+    borderRadius: 160,
+    backgroundColor: "#153023",
     borderWidth: 1,
-    borderColor: "rgba(201,169,97,0.12)",
+    borderColor: "rgba(201,169,97,0.08)",
   },
   potCenter: {
     position: "absolute",
     left: 0,
     right: 0,
-    top: TABLE_H / 2 - 46,
+    top: TABLE_H / 2 - 60,
     alignItems: "center",
   },
-  potKicker: {
+  // Dark pill card that holds the total pot. Same height and visual language
+  // as the per-seat bet chips so chips-out and pot-in read as one system.
+  potCard: {
+    height: BET_H,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    backgroundColor: "rgba(11,20,16,0.92)",
+    borderWidth: 1,
+    borderColor: colors.hairStrong,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    shadowColor: "#000",
+    shadowOpacity: 0.45,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 },
+  },
+  potCardText: {
+    color: colors.gold,
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: -0.2,
+    fontVariant: ["tabular-nums"],
+  },
+  // A dimmer, smaller pill below the Total — only shown when there are side
+  // pots so the user can see the breakdown without opening the showdown dock.
+  subPotCard: {
+    height: BET_H - 4,
+    paddingHorizontal: 8,
+    borderRadius: 6,
+    backgroundColor: "rgba(11,20,16,0.85)",
+    borderWidth: 1,
+    borderColor: colors.hair,
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 4,
+  },
+  subPotText: {
     color: colors.mute,
     fontSize: 10,
     fontWeight: "600",
-    letterSpacing: 1.6,
-    textTransform: "uppercase",
+    letterSpacing: -0.1,
+    fontVariant: ["tabular-nums"],
   },
-  actionText: {
+  cardRow: {
+    flexDirection: "row",
+    gap: 4,
+    marginTop: 12,
+  },
+  cardBack: {
+    width: COMMUNITY_CARD_W,
+    height: COMMUNITY_CARD_H,
+    borderRadius: 3,
+    backgroundColor: colors.danger,
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+  cardSlot: {
+    width: COMMUNITY_CARD_W,
+    height: COMMUNITY_CARD_H,
+    borderRadius: 3,
+    borderWidth: 1,
+    borderColor: "rgba(201,169,97,0.2)",
+    borderStyle: "dashed",
+  },
+  streetLabel: {
     color: colors.mute,
-    fontSize: 12,
-    marginTop: 6,
+    fontSize: 10,
+    fontWeight: "700",
+    letterSpacing: 1.4,
+    marginTop: 8,
   },
-  // Seat pill — reuses the lobby's visual language
+  holeCards: {
+    position: "absolute",
+    height: HOLE_CARD_H,
+    zIndex: 0,
+  },
+  holeCard: {
+    position: "absolute",
+    width: HOLE_CARD_W,
+    height: HOLE_CARD_H,
+    borderRadius: 3,
+    backgroundColor: colors.danger,
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+  holeCardLeft: {
+    left: 0,
+    transform: [{ rotate: "-5deg" }],
+  },
+  holeCardRight: {
+    right: 0,
+    transform: [{ rotate: "5deg" }],
+  },
   handSeatPill: {
     position: "absolute",
     width: PILL_W,
     height: PILL_H,
-    borderRadius: 24,
+    borderRadius: 10,
     backgroundColor: "#14231b",
     borderWidth: 1,
     borderColor: "rgba(201,169,97,0.18)",
     flexDirection: "row",
     alignItems: "center",
-    paddingLeft: 4,
+    paddingLeft: 6,
     paddingRight: 8,
-    gap: 8,
-  },
-  handSeatPillMe: {
-    borderColor: colors.gold,
+    gap: 6,
   },
   handSeatPillToAct: {
     borderColor: colors.gold,
@@ -1119,167 +1241,107 @@ const styles = StyleSheet.create({
     opacity: 0.4,
   },
   handSeatAvatar: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
     alignItems: "center",
     justifyContent: "center",
   },
   handSeatAvatarText: {
     color: "rgba(0,0,0,0.75)",
-    fontSize: 13,
+    fontSize: 10,
     fontWeight: "700",
     letterSpacing: -0.3,
   },
-  handSeatInfo: { flex: 1, minWidth: 0 },
-  handSeatName: {
-    color: colors.text,
-    fontSize: 13,
-    fontWeight: "600",
-  },
-  handSeatBadge: {
-    color: colors.gold,
-    fontSize: 8,
-    fontWeight: "800",
-    letterSpacing: 0.6,
+  handSeatStackRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
   },
   handSeatStack: {
     fontFamily: typography.serif,
     fontStyle: "italic",
-    fontSize: 14,
+    fontSize: 13,
     color: colors.gold,
-    marginTop: 1,
   },
   handDealerButton: {
     position: "absolute",
-    bottom: -8,
-    right: -8,
-    width: 24,
-    height: 24,
-    borderRadius: 12,
+    bottom: -5,
+    right: -5,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
     backgroundColor: colors.ivory,
-    borderWidth: 2,
+    borderWidth: 1.5,
     borderColor: colors.bg,
     alignItems: "center",
     justifyContent: "center",
     zIndex: 2,
     shadowColor: "#000",
     shadowOpacity: 0.35,
-    shadowRadius: 3,
+    shadowRadius: 2,
     shadowOffset: { width: 0, height: 1 },
   },
   handDealerButtonText: {
     color: colors.bg,
-    fontSize: 11,
+    fontSize: 8,
     fontWeight: "800",
     letterSpacing: -0.3,
   },
-  handPositionBadge: {
+  handHostChip: {
     position: "absolute",
-    top: -6,
-    right: -6,
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 5,
-    backgroundColor: "#4a7e99",
+    top: -5,
+    right: -5,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: colors.gold,
+    borderWidth: 1.5,
+    borderColor: colors.bg,
+    alignItems: "center",
+    justifyContent: "center",
     zIndex: 2,
+    shadowColor: "#000",
+    shadowOpacity: 0.35,
+    shadowRadius: 2,
+    shadowOffset: { width: 0, height: 1 },
   },
-  handPositionBadgeText: {
-    color: "#fff",
-    fontSize: 9,
-    fontWeight: "800",
-    letterSpacing: 0.5,
+  // Fixed-width anchor centered on the oval rail. The inner chip
+  // shrink-wraps so there's no trailing whitespace — "1" and "999" both
+  // look tight.
+  betChipAnchor: {
+    position: "absolute",
+    width: BET_ANCHOR_W,
+    height: BET_H,
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 3,
   },
-  handFoldedLabel: {
-    color: colors.mute,
-    fontSize: 9,
+  betChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+    backgroundColor: "rgba(11,20,16,0.92)",
+    borderWidth: 1,
+    borderColor: colors.hairStrong,
+  },
+  betChipText: {
+    color: colors.gold,
+    fontSize: 12,
     fontWeight: "700",
-    letterSpacing: 1.2,
-    textAlign: "center",
-    marginTop: 4,
+    fontVariant: ["tabular-nums"],
+    letterSpacing: -0.2,
   },
-
-  // -------- Existing styles (old theme-based — used by ActionDock, MeMenu, etc.) --------
   container: { flex: 1, backgroundColor: colors.bg },
   loading: { justifyContent: "center", alignItems: "center" },
-  scroll: { padding: 16, paddingBottom: 24 },
-  header: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "baseline",
-    paddingHorizontal: 8,
-  },
-  code: { color: colors.mute, fontSize: 14, letterSpacing: 4 },
-  streetLabel: {
-    color: colors.text,
-    fontSize: 14,
-    fontWeight: "600",
-    textTransform: "uppercase",
-    letterSpacing: 1,
-  },
-  potBox: {
-    alignItems: "center",
-    marginTop: 16,
-    paddingVertical: 24,
-    backgroundColor: colors.surface,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: colors.hair,
-  },
-  potLabel: {
-    color: colors.mute,
-    fontSize: 12,
-    textTransform: "uppercase",
-    letterSpacing: 1.5,
-  },
-  potValue: {
-    color: colors.text,
-    fontSize: 56,
-    fontWeight: "800",
-    fontVariant: ["tabular-nums"],
-    marginTop: 4,
-  },
-  muted: { color: colors.mute, fontSize: 14, marginTop: 4 },
-  seatsList: { marginTop: 16 },
-  seatRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: colors.surface,
-    borderColor: colors.hair,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 8,
-  },
-  seatRowToAct: {
-    borderColor: colors.gold,
-    borderWidth: 2,
-  },
-  seatRowFolded: {
-    opacity: 0.5,
-  },
-  colorDot: { width: 20, height: 20, borderRadius: 10 },
-  seatBody: { flex: 1, marginLeft: 12 },
-  seatNameRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  seatName: { color: colors.text, fontSize: 16, fontWeight: "600" },
-  seatStatus: { color: colors.mute, fontSize: 13, marginTop: 2 },
-  pill: {
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  pillText: { fontSize: 10, fontWeight: "700", letterSpacing: 0.5 },
   dock: {
     padding: 16,
     paddingTop: 12,
     backgroundColor: "rgba(255,255,255,0.02)",
-  },
-  dockHeader: {
-    color: colors.text,
-    fontSize: 14,
-    fontWeight: "600",
-    marginBottom: 8,
-    textAlign: "center",
   },
   dockMuted: {
     color: colors.mute,
@@ -1287,37 +1349,40 @@ const styles = StyleSheet.create({
     paddingVertical: 18,
     fontSize: 14,
   },
-  myTurnDock: {
+  turnDock: {
     marginHorizontal: 12,
+    marginTop: 20,
     marginBottom: 16,
-    padding: 14,
     borderRadius: 18,
     backgroundColor: "rgba(255,255,255,0.04)",
     borderWidth: 1,
     borderColor: "rgba(201,169,97,0.25)",
+    overflow: "hidden",
   },
-  myTurnHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
+  turnDockHeader: {
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 14,
     alignItems: "center",
-    marginBottom: 10,
-    paddingHorizontal: 4,
   },
-  myTurnKicker: {
+  dragHandle: {
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.hairStrong,
+    marginBottom: 10,
+  },
+  turnDockHeaderText: {
     color: colors.gold,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: "800",
-    letterSpacing: 1.4,
+    letterSpacing: 1.2,
     textTransform: "uppercase",
   },
-  myTurnCall: {
-    color: colors.mute,
-    fontSize: 12,
-  },
-  myTurnCallAmt: {
-    color: colors.gold,
-    fontWeight: "800",
-    fontSize: 14,
+  turnDockBody: {
+    paddingHorizontal: 14,
+    paddingBottom: 14,
+    gap: 8,
   },
   actionRow: {
     flexDirection: "row",
@@ -1332,41 +1397,49 @@ const styles = StyleSheet.create({
     minHeight: 60,
   },
   actionBtnFold: {
-    backgroundColor: "rgba(255,255,255,0.04)",
+    backgroundColor: "rgba(201,72,72,0.1)",
     borderWidth: 1,
-    borderColor: "rgba(201,169,97,0.2)",
+    borderColor: "rgba(201,72,72,0.5)",
   },
   actionBtnTextFold: {
-    color: colors.mute,
+    color: colors.text,
     fontSize: 15,
     fontWeight: "700",
   },
   actionBtnCall: {
-    backgroundColor: "#2a4a35",
+    backgroundColor: "rgba(90,168,120,0.1)",
     borderWidth: 1,
-    borderColor: "#3a6049",
+    borderColor: "rgba(90,168,120,0.5)",
   },
   actionBtnTextCall: {
-    color: colors.ivory,
+    color: colors.text,
     fontSize: 15,
     fontWeight: "700",
   },
   actionBtnRaise: {
-    backgroundColor: colors.gold,
+    backgroundColor: "rgba(201,169,97,0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(201,169,97,0.5)",
   },
   actionBtnTextRaise: {
-    color: colors.bg,
+    color: colors.text,
     fontSize: 15,
-    fontWeight: "800",
+    fontWeight: "700",
   },
-  cta: {
-    backgroundColor: colors.gold,
-    paddingVertical: 18,
-    borderRadius: 12,
-    alignItems: "center",
+  // Disabled action button — neutral, dim, no accent color. Subtle enough
+  // not to dominate, but clearly reads as "unavailable."
+  actionBtnInactive: {
+    backgroundColor: "rgba(255,255,255,0.02)",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.08)",
+  },
+  actionBtnTextInactive: {
+    color: colors.mute,
+    fontSize: 15,
+    fontWeight: "700",
   },
   ctaDisabled: { opacity: 0.4 },
-  ctaText: { color: colors.bg, fontSize: 18, fontWeight: "700" },
+  btnPressed: { opacity: 0.55 },
   error: {
     color: colors.danger,
     marginVertical: 8,
@@ -1376,89 +1449,58 @@ const styles = StyleSheet.create({
   showdownRow: {
     flexDirection: "row",
     flexWrap: "wrap",
-    gap: 8,
-    marginVertical: 8,
-    justifyContent: "center",
+    gap: 6,
   },
-  showdownPill: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    borderRadius: 12,
-    borderWidth: 2,
-    minHeight: 48,
-  },
-  showdownPillText: { fontSize: 16, fontWeight: "700" },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.7)",
-    justifyContent: "center",
-    alignItems: "center",
-    padding: 24,
-  },
-  modalCard: {
-    backgroundColor: colors.surface,
-    borderRadius: 16,
-    padding: 24,
-    width: "100%",
-    maxWidth: 360,
-    borderWidth: 1,
-    borderColor: colors.hair,
-  },
-  modalTitle: { color: colors.text, fontSize: 20, fontWeight: "700" },
-  modalSubtitle: { color: colors.mute, fontSize: 14, marginTop: 4 },
-  modalInput: {
-    backgroundColor: colors.raised,
-    borderColor: colors.hair,
-    borderWidth: 1,
-    borderRadius: 10,
+  showdownName: {
     color: colors.text,
-    fontSize: 28,
-    fontWeight: "700",
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-    marginTop: 16,
-    textAlign: "center",
+    fontSize: 14,
+    fontWeight: "600",
   },
-  modalActions: { flexDirection: "row", gap: 12, marginTop: 16 },
-  modalButton: {
-    flex: 1,
-    paddingVertical: 14,
-    borderRadius: 10,
+  sliderRow: {
+    flexDirection: "row",
     alignItems: "center",
-  },
-  modalCancel: {
-    backgroundColor: "transparent",
-    borderColor: colors.hair,
-    borderWidth: 1,
-  },
-  modalConfirm: { backgroundColor: colors.gold },
-  modalButtonText: { color: colors.bg, fontWeight: "700", fontSize: 16 },
-  menuButton: { color: colors.text, fontSize: 18 },
-  undoRow: {
+    gap: 8,
     marginTop: 12,
-    alignItems: "flex-end",
   },
-  undoBtn: {
-    backgroundColor: colors.surface,
-    borderColor: colors.gold,
+  slider: {
+    flex: 1,
+    height: 40,
+  },
+  stepBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: "rgba(255,255,255,0.04)",
     borderWidth: 1,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  undoBtnText: { color: colors.gold, fontWeight: "700", fontSize: 13 },
-  menuItem: {
-    backgroundColor: colors.raised,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    borderRadius: 10,
-    marginTop: 10,
+    borderColor: colors.hairStrong,
     alignItems: "center",
+    justifyContent: "center",
   },
-  menuItemDanger: {
-    borderColor: colors.danger,
+  stepBtnText: {
+    color: colors.text,
+    fontSize: 20,
+    fontWeight: "700",
+    lineHeight: 22,
+  },
+  quickRow: {
+    flexDirection: "row",
+    gap: 6,
+    marginTop: 8,
+  },
+  quickBtn: {
+    flex: 1,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.04)",
     borderWidth: 1,
-    backgroundColor: "transparent",
+    borderColor: colors.hairStrong,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  menuItemText: { color: colors.text, fontSize: 16, fontWeight: "600" },
+  quickBtnText: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "700",
+    letterSpacing: 0.2,
+  },
 });
