@@ -22,6 +22,7 @@ import Animated, {
   useAnimatedStyle,
   useSharedValue,
   withTiming,
+  ZoomIn,
 } from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -102,6 +103,13 @@ function dealerButtonPosition(
 }
 
 const DEALER_ANIM_MS = 500;
+// Blinds reveal sequence: SB pops in after the dealer button settles, then BB
+// after a brief beat. ANIM_TOTAL_MS is when the table returns to its normal
+// state (animPhase = "done").
+const SB_DELAY_MS = 700;
+const BB_DELAY_MS = 1100;
+const POP_ANIM_MS = 280;
+const ANIM_TOTAL_MS = 1500;
 
 function communityCardCount(street: Hand["street"]): number {
   if (street === "preflop") return 0;
@@ -204,6 +212,42 @@ export default function HandScreen() {
     lastStreetRef.current = newStreet;
   }, [handView, seats, userId]);
 
+  // Hand-transition animation timeline. When the current hand changes (a hand
+  // ended and the next one auto-started), step the table through:
+  //   "dealer"  → dealer button slides to its new seat
+  //   "sb"      → SB chip pops in, displayed pot becomes SB
+  //   "bb"      → BB chip pops in, displayed pot becomes SB+BB
+  //   "done"    → normal state (pot reflects hand.pot, no entering anims)
+  // First time we see a hand on the screen we go straight to "done" — there's
+  // no prior hand to transition from.
+  const [animPhase, setAnimPhase] = useState<
+    "dealer" | "sb" | "bb" | "done"
+  >("done");
+  const prevAnimHandIdRef = useRef<Id<"hands"> | undefined>(undefined);
+  const currentHandId = handView?.hand?._id;
+  useEffect(() => {
+    if (!currentHandId) {
+      prevAnimHandIdRef.current = undefined;
+      setAnimPhase("done");
+      return;
+    }
+    if (prevAnimHandIdRef.current === undefined) {
+      prevAnimHandIdRef.current = currentHandId;
+      return;
+    }
+    if (prevAnimHandIdRef.current === currentHandId) return;
+    prevAnimHandIdRef.current = currentHandId;
+    setAnimPhase("dealer");
+    const t1 = setTimeout(() => setAnimPhase("sb"), SB_DELAY_MS);
+    const t2 = setTimeout(() => setAnimPhase("bb"), BB_DELAY_MS);
+    const t3 = setTimeout(() => setAnimPhase("done"), ANIM_TOTAL_MS);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [currentHandId]);
+
   if (!table || !seats || handView === undefined || !userId) {
     return (
       <SafeAreaView style={[styles.container, styles.loading]}>
@@ -215,6 +259,38 @@ export default function HandScreen() {
   const mySeat = seats.find((s) => s.userId === userId);
   const hand = handView?.hand;
   const actions = handView?.actions ?? [];
+
+  // Detect hand transition synchronously in render so the SB/BB chips can
+  // attach their `entering` animation on the very first mount with the new
+  // hand id (otherwise they'd flash full-size for one frame before the
+  // useEffect-driven phase update kicks in).
+  const isHandTransitionStart =
+    !!hand &&
+    prevAnimHandIdRef.current !== undefined &&
+    prevAnimHandIdRef.current !== hand._id;
+  const effectivePhase = isHandTransitionStart ? "dealer" : animPhase;
+  const animatingTransition = effectivePhase !== "done";
+
+  // SB/BB seats and amounts on the current hand, used to drive the staggered
+  // pot reveal and the per-chip entering animations.
+  const sbAction = actions.find((a) => a.type === "post_sb");
+  const bbAction = actions.find((a) => a.type === "post_bb");
+  const sbSeatId = sbAction?.seatId;
+  const bbSeatId = bbAction?.seatId;
+  const sbAmount = sbAction?.amount ?? 0;
+  const bbAmount = bbAction?.amount ?? 0;
+
+  // Displayed pot during the transition steps up: 0 → SB → SB+BB → actual.
+  // After "done", we just mirror hand.pot.
+  const displayedPot = !hand
+    ? 0
+    : effectivePhase === "dealer"
+      ? 0
+      : effectivePhase === "sb"
+        ? sbAmount
+        : effectivePhase === "bb"
+          ? sbAmount + bbAmount
+          : hand.pot;
 
   // Per-seat chips put in on the CURRENT betting street. Cleared when the
   // street advances (actions from prior streets don't match) — mirrors what
@@ -281,7 +357,7 @@ export default function HandScreen() {
           <View style={styles.potCenter}>
             <View style={styles.potCard}>
               <Text style={styles.potCardText}>
-                Total: {(hand?.pot ?? 0) / table.bigBlind}
+                Total: {displayedPot / table.bigBlind}
               </Text>
             </View>
             {potStructure && potStructure.pots.length > 1
@@ -378,9 +454,26 @@ export default function HandScreen() {
           {seats.map((seat, i) => {
             const amount = committedByStreet.get(seat._id) ?? 0;
             if (amount === 0) return null;
+            // Pop-in animation runs whenever a chip first appears for a seat
+            // on the current street. The blinds on a fresh hand wait for the
+            // dealer-button slide to finish before they pop; everything else
+            // pops in immediately at mount.
+            const isSbBlind =
+              animatingTransition && seat._id === sbSeatId;
+            const isBbBlind =
+              animatingTransition && seat._id === bbSeatId;
+            const entering = isSbBlind
+              ? ZoomIn.delay(SB_DELAY_MS).duration(POP_ANIM_MS).springify()
+              : isBbBlind
+                ? ZoomIn.delay(BB_DELAY_MS).duration(POP_ANIM_MS).springify()
+                : ZoomIn.duration(POP_ANIM_MS).springify();
             return (
-              <View
-                key={`bet-${seat._id}`}
+              <Animated.View
+                // Key includes hand id and street so the chip remounts (and
+                // re-runs its entering animation) when a player first
+                // contributes on a new street, not just on a new hand.
+                key={`bet-${hand?._id}-${hand?.street}-${seat._id}`}
+                entering={entering}
                 style={[
                   styles.betChipAnchor,
                   betPosition(i, seats.length, meIndex),
@@ -395,7 +488,7 @@ export default function HandScreen() {
                   />
                   <Text style={styles.betChipText}>{amount}</Text>
                 </View>
-              </View>
+              </Animated.View>
             );
           })}
         </Animated.View>
