@@ -7,6 +7,12 @@ import { useEffect, useState } from "react";
 import { Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+// Set once we've completed the auth + active-game gating below. The logo
+// splash on this screen exists to bridge the native launch splash on cold
+// start; on any subsequent navigation back to `/` (e.g. settle → Done) the
+// gate has already run, so we skip it and render home immediately.
+let hasInitialized = false;
+
 export default function Index() {
   const router = useRouter();
   const { isAuthenticated, isLoading: authLoading } = useConvexAuth();
@@ -14,19 +20,26 @@ export default function Index() {
   const createGame = useMutation(api.games.createGame);
   const convex = useConvex();
   const [creatingTable, setCreatingTable] = useState(false);
-  const [checkingForActiveTable, setCheckingForActiveTable] = useState(true);
+  const [checkingForActiveTable, setCheckingForActiveTable] = useState(
+    !hasInitialized,
+  );
 
   // Resume an in-progress game if one exists. One-shot read so we don't
-  // stay subscribed.
+  // stay subscribed. Guarded by the module-level `hasInitialized` flag so
+  // it only runs the first time `/` is reached this session — repeated
+  // navigations back to home (e.g. from the settle screen) skip the splash.
   useEffect(() => {
+    if (hasInitialized) return;
     if (authLoading) return;
     if (!isAuthenticated) {
+      hasInitialized = true;
       setCheckingForActiveTable(false);
       return;
     }
     let cancelled = false;
     convex.query(api.games.getMyActiveGame).then((result) => {
       if (cancelled) return;
+      hasInitialized = true;
       if (result?.game.status === "lobby") {
         router.replace(`/table/${result.game.code}/lobby`);
       } else if (result?.game.status === "active") {
