@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "PokerStacks",
-    "slug": "PokerStacks",
+    "slug": "pokerstacks",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -40,6 +40,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "69de7887-e931-4306-82bb-e91478277a84"
+      }
+    },
+    "owner": "byronkarlen"
   }
 }
