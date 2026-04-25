@@ -17,7 +17,12 @@ import {
   Text,
   View,
 } from "react-native";
-import Animated, { LinearTransition } from "react-native-reanimated";
+import Animated, {
+  LinearTransition,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 type SeatWithProfile = Doc<"seats"> & { displayName: string };
@@ -58,11 +63,6 @@ const COMMUNITY_CARD_H = 22;
 const HOLE_CARD_W = COMMUNITY_CARD_W;
 const HOLE_CARD_H = COMMUNITY_CARD_H;
 
-// Bet chip sits right on the oval's rail — its center lands on the oval
-// edge at the seat's angle, so chips visually "rest on" the table rim.
-const OVAL_RX = 105;
-const OVAL_RY = 180;
-
 // Anchor point (center) for the bet chip. The chip itself is wrapped in a
 // zero-size anchor View with flex-centered children so it shrink-wraps to
 // its own content (no trailing whitespace on short amounts).
@@ -84,6 +84,24 @@ function betPosition(index: number, total: number, meIndex: number) {
     top,
   };
 }
+
+// Dealer button (rendered as a top-level child of tableArea so it can animate
+// across pills when the button moves between hands). Anchors to the
+// bottom-right of the pill to match the original in-pill placement.
+const DEALER_BTN_SIZE = 16;
+function dealerButtonPosition(
+  index: number,
+  total: number,
+  meIndex: number,
+): { left: number; top: number } {
+  const seatPos = seatPosition(index, total, meIndex);
+  return {
+    left: seatPos.left + PILL_W - DEALER_BTN_SIZE + 5,
+    top: seatPos.top + PILL_H - DEALER_BTN_SIZE + 5,
+  };
+}
+
+const DEALER_ANIM_MS = 500;
 
 function communityCardCount(street: Hand["street"]): number {
   if (street === "preflop") return 0;
@@ -331,12 +349,6 @@ export default function HandScreen() {
               seat={seat}
               isHostSeat={seat.userId === table.hostUserId}
               isMe={seat.userId === userId}
-              isDealer={
-                hand
-                  ? hand.dealerSeatIndex === seat.seatIndex
-                  : seat.seatIndex ===
-                    (table.dealerSeatIndex < 0 ? 0 : table.dealerSeatIndex)
-              }
               isToAct={
                 hand?.toActSeatIndex !== undefined &&
                 hand.toActSeatIndex === seat.seatIndex
@@ -351,6 +363,18 @@ export default function HandScreen() {
               position={seatPosition(i, seats.length, meIndex)}
             />
           ))}
+          <DealerButton
+            seats={seats}
+            meIndex={meIndex}
+            dealerSeatIndex={
+              hand
+                ? hand.dealerSeatIndex
+                : table.dealerSeatIndex < 0
+                  ? 0
+                  : table.dealerSeatIndex
+            }
+            handId={hand?._id}
+          />
           {seats.map((seat, i) => {
             const amount = committedByStreet.get(seat._id) ?? 0;
             if (amount === 0) return null;
@@ -396,7 +420,6 @@ function HandSeatPill({
   seat,
   isHostSeat,
   isMe,
-  isDealer,
   isToAct,
   isFolded,
   bigBlind,
@@ -405,7 +428,6 @@ function HandSeatPill({
   seat: SeatWithProfile;
   isHostSeat: boolean;
   isMe: boolean;
-  isDealer: boolean;
   isToAct: boolean;
   isFolded: boolean;
   bigBlind: number;
@@ -425,11 +447,6 @@ function HandSeatPill({
             <MaterialCommunityIcons name="crown" size={9} color={colors.bg} />
           </View>
         ) : null}
-        {isDealer ? (
-          <View style={styles.handDealerButton}>
-            <Text style={styles.handDealerButtonText}>B</Text>
-          </View>
-        ) : null}
         <View
           style={[
             styles.handSeatAvatar,
@@ -447,6 +464,68 @@ function HandSeatPill({
         </View>
       </View>
     </View>
+  );
+}
+
+// =============================================================================
+// DealerButton
+// =============================================================================
+
+// Top-level dealer button rendered as a child of tableArea. Animates between
+// seat positions when the hand changes (button rotates clockwise to the next
+// active player). On first mount we snap to the current dealer with no
+// animation.
+function DealerButton({
+  seats,
+  meIndex,
+  dealerSeatIndex,
+  handId,
+}: {
+  seats: SeatWithProfile[];
+  meIndex: number;
+  dealerSeatIndex: number;
+  handId: Id<"hands"> | undefined;
+}) {
+  const dealerArrayIdx = Math.max(
+    0,
+    seats.findIndex((s) => s.seatIndex === dealerSeatIndex),
+  );
+  const target = dealerButtonPosition(dealerArrayIdx, seats.length, meIndex);
+
+  const left = useSharedValue(target.left);
+  const top = useSharedValue(target.top);
+  // Track which hand we last animated for so we only animate on hand
+  // transitions, not on every render or on screen mount.
+  const prevHandIdRef = useRef<Id<"hands"> | undefined>(handId);
+
+  useEffect(() => {
+    if (prevHandIdRef.current === handId) {
+      // Same hand (or both undefined). Keep position in sync without
+      // animating in case seats reorder or meIndex shifts.
+      left.value = target.left;
+      top.value = target.top;
+      return;
+    }
+    if (prevHandIdRef.current === undefined) {
+      // First hand seen on this screen — snap, don't slide.
+      left.value = target.left;
+      top.value = target.top;
+    } else {
+      left.value = withTiming(target.left, { duration: DEALER_ANIM_MS });
+      top.value = withTiming(target.top, { duration: DEALER_ANIM_MS });
+    }
+    prevHandIdRef.current = handId;
+  }, [handId, target.left, target.top, left, top]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    left: left.value,
+    top: top.value,
+  }));
+
+  return (
+    <Animated.View style={[styles.handDealerButton, animatedStyle]}>
+      <Text style={styles.handDealerButtonText}>B</Text>
+    </Animated.View>
   );
 }
 
@@ -1267,17 +1346,15 @@ const styles = StyleSheet.create({
   },
   handDealerButton: {
     position: "absolute",
-    bottom: -5,
-    right: -5,
-    width: 16,
-    height: 16,
-    borderRadius: 8,
+    width: DEALER_BTN_SIZE,
+    height: DEALER_BTN_SIZE,
+    borderRadius: DEALER_BTN_SIZE / 2,
     backgroundColor: colors.ivory,
     borderWidth: 1.5,
     borderColor: colors.bg,
     alignItems: "center",
     justifyContent: "center",
-    zIndex: 2,
+    zIndex: 5,
     shadowColor: "#000",
     shadowOpacity: 0.35,
     shadowRadius: 2,
