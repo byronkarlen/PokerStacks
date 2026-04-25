@@ -1,8 +1,11 @@
 import { api } from "@/convex/_generated/api";
-import { Doc } from "@/convex/_generated/dataModel";
+import { DealerButton } from "@/components/table/DealerButton";
+import { OvalFelt } from "@/components/table/OvalFelt";
+import { PotCard } from "@/components/table/PotCard";
+import { SeatPill } from "@/components/table/SeatPill";
+import { seatPosition } from "@/components/table/geometry";
 import { useMe } from "@/hooks/useMe";
-import { colorHex, colors, typography } from "@/theme";
-import { MaterialCommunityIcons } from "@expo/vector-icons";
+import { colors, typography } from "@/theme";
 import { useMutation, useQuery } from "convex/react";
 import * as Haptics from "expo-haptics";
 import { useLocalSearchParams, useRouter } from "expo-router";
@@ -10,26 +13,9 @@ import { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type SeatWithProfile = Doc<"seats"> & { displayName: string };
-
-const TABLE_W = 340;
-const TABLE_H = 440;
-const SEAT_RX = 125;
-const SEAT_RY = 200;
-const PILL_W = 78;
-const PILL_H = 28;
-
-// "me" sits at angle π/2 (bottom of oval); everyone else rotates around.
-function seatPosition(index: number, total: number, meIndex: number) {
-  const angle = ((index - meIndex) / total) * Math.PI * 2 + Math.PI / 2;
-  const cx = TABLE_W / 2;
-  const cy = TABLE_H / 2;
-  return {
-    left: cx + SEAT_RX * Math.cos(angle) - PILL_W / 2,
-    top: cy + SEAT_RY * Math.sin(angle) - PILL_H / 2,
-  };
-}
-
+// Pre-game lobby. Players see the table code, watch others join, the host
+// presses "Start" once at least 2 are seated. Auto-redirects to /hand when
+// the host starts, or back home if the game is canceled.
 export default function Lobby() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
@@ -47,15 +33,14 @@ export default function Lobby() {
   const endGame = useMutation(api.games.endGame);
   const leaveTable = useMutation(api.games.leaveGame);
 
+  // Drive route changes from the table's lifecycle so all clients react
+  // simultaneously when the host starts/cancels.
   useEffect(() => {
     if (table?.status === "active") {
       router.replace(`/table/${code}/hand`);
     } else if (table?.status === "ended") {
-      if (router.canGoBack()) {
-        router.back();
-      } else {
-        router.replace("/");
-      }
+      if (router.canGoBack()) router.back();
+      else router.replace("/");
     }
   }, [table?.status, code, router]);
 
@@ -74,16 +59,20 @@ export default function Lobby() {
   const isHost = !!userId && table.hostUserId === userId;
   const readyCount = seats.filter((s) => s.status === "active").length;
   const canStart = isHost && readyCount >= 2;
-  const buyInBB = table.defaultBuyIn / table.bigBlind;
-  const totalChips = seats.reduce((sum, s) => sum + s.chipStack, 0);
-  const totalBB = totalChips / table.bigBlind;
+  const buyInBigBlinds = table.defaultBuyIn / table.bigBlind;
+  const totalChipsOnTable = seats.reduce((sum, s) => sum + s.chipStack, 0);
+  const totalChipsInBigBlinds = totalChipsOnTable / table.bigBlind;
+
+  // Where the local user sits — pinned to the bottom of the oval; everyone
+  // else rotates around. Falls back to seat 0 if the user isn't seated.
   const meIndex = Math.max(
     0,
     seats.findIndex((s) => s.userId === userId),
   );
-  // Backend stores -1 until the first hand deals; hands.ts interprets that as
-  // seat 0 (the host), so display that same seat with the dealer button.
-  const effectiveDealerIdx =
+
+  // Backend stores -1 until the first hand deals; hands.ts interprets that
+  // as seat 0 (the host), so display the dealer button on that same seat.
+  const dealerSeatIndex =
     table.dealerSeatIndex < 0 ? 0 : table.dealerSeatIndex;
 
   async function handleStart() {
@@ -114,11 +103,8 @@ export default function Lobby() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
     try {
       await leaveTable({ gameId: table._id });
-      if (router.canGoBack()) {
-        router.back();
-      } else {
-        router.replace("/");
-      }
+      if (router.canGoBack()) router.back();
+      else router.replace("/");
     } catch {
       setLeaving(false);
     }
@@ -133,30 +119,31 @@ export default function Lobby() {
         </View>
         <View style={styles.headerRight}>
           <Text style={styles.kicker}>Buy-in</Text>
-          <Text style={styles.stakes}>{buyInBB} BB</Text>
+          <Text style={styles.stakes}>{buyInBigBlinds} BB</Text>
         </View>
       </View>
 
       <View style={styles.tableWrap}>
-        <View style={styles.tableArea}>
-          <View style={styles.oval} />
+        <OvalFelt>
           <View style={styles.potCenter}>
-            <View style={styles.potCard}>
-              <Text style={styles.potCardText}>Total: {totalBB}</Text>
-            </View>
+            <PotCard>Total: {totalChipsInBigBlinds}</PotCard>
           </View>
           {seats.map((seat, i) => (
             <SeatPill
               key={seat._id}
               seat={seat}
               isHostSeat={seat.userId === table.hostUserId}
-              isMe={seat.userId === userId}
-              isDealer={seat.seatIndex === effectiveDealerIdx}
               bigBlind={table.bigBlind}
               position={seatPosition(i, seats.length, meIndex)}
             />
           ))}
-        </View>
+          <DealerButton
+            seats={seats}
+            meIndex={meIndex}
+            dealerSeatIndex={dealerSeatIndex}
+            handId={undefined}
+          />
+        </OvalFelt>
       </View>
 
       <View style={styles.footer}>
@@ -203,49 +190,6 @@ export default function Lobby() {
   );
 }
 
-function SeatPill({
-  seat,
-  isHostSeat,
-  isMe,
-  isDealer,
-  bigBlind,
-  position,
-}: {
-  seat: SeatWithProfile;
-  isHostSeat: boolean;
-  isMe: boolean;
-  isDealer: boolean;
-  bigBlind: number;
-  position: { left: number; top: number };
-}) {
-  return (
-    <View style={[styles.seatPill, position]}>
-      {isHostSeat ? (
-        <View style={styles.hostChip}>
-          <MaterialCommunityIcons name="crown" size={9} color={colors.bg} />
-        </View>
-      ) : null}
-      {isDealer ? (
-        <View style={styles.dealerButton}>
-          <Text style={styles.dealerButtonText}>B</Text>
-        </View>
-      ) : null}
-      <View
-        style={[styles.seatAvatar, { backgroundColor: colorHex(seat.color) }]}
-      >
-        <Text style={styles.seatAvatarText}>
-          {seat.displayName.slice(0, 1).toUpperCase()}
-        </Text>
-      </View>
-      <View style={styles.seatStackRow}>
-        <Text style={styles.seatStack} numberOfLines={1}>
-          {seat.chipStack / bigBlind}
-        </Text>
-      </View>
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   loading: { justifyContent: "center", alignItems: "center" },
@@ -287,134 +231,14 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  tableArea: {
-    width: TABLE_W,
-    height: TABLE_H,
-  },
-  oval: {
-    position: "absolute",
-    left: (TABLE_W - 210) / 2,
-    top: (TABLE_H - 360) / 2,
-    width: 210,
-    height: 360,
-    borderRadius: 160,
-    backgroundColor: "#153023",
-    borderWidth: 1,
-    borderColor: "rgba(201,169,97,0.08)",
-  },
+  // PotCard sits at the felt center — small offset above geometric center so
+  // it lines up visually with the felt's optical center.
   potCenter: {
     position: "absolute",
     left: 0,
     right: 0,
-    top: TABLE_H / 2 - 11,
+    top: 220 - 11,
     alignItems: "center",
-  },
-  potCard: {
-    height: 22,
-    paddingHorizontal: 10,
-    borderRadius: 11,
-    backgroundColor: "rgba(11,20,16,0.92)",
-    borderWidth: 1,
-    borderColor: colors.hairStrong,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    shadowColor: "#000",
-    shadowOpacity: 0.45,
-    shadowRadius: 3,
-    shadowOffset: { width: 0, height: 1 },
-  },
-  potCardText: {
-    color: colors.gold,
-    fontSize: 12,
-    fontWeight: "700",
-    letterSpacing: -0.2,
-    fontVariant: ["tabular-nums"],
-  },
-
-  seatPill: {
-    position: "absolute",
-    width: PILL_W,
-    height: PILL_H,
-    borderRadius: 10,
-    backgroundColor: "#14231b",
-    borderWidth: 1,
-    borderColor: "rgba(201,169,97,0.18)",
-    flexDirection: "row",
-    alignItems: "center",
-    paddingLeft: 6,
-    paddingRight: 8,
-    gap: 6,
-  },
-  seatAvatar: {
-    width: 18,
-    height: 18,
-    borderRadius: 9,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  seatAvatarText: {
-    color: "rgba(0,0,0,0.75)",
-    fontSize: 10,
-    fontWeight: "700",
-    letterSpacing: -0.3,
-  },
-  seatStackRow: {
-    flex: 1,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 3,
-  },
-  seatStack: {
-    fontFamily: typography.serif,
-    fontStyle: "italic",
-    fontSize: 13,
-    color: colors.gold,
-  },
-  // "B" = the Button (dealer position), circular ivory chip bottom-right.
-  dealerButton: {
-    position: "absolute",
-    bottom: -5,
-    right: -5,
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: colors.ivory,
-    borderWidth: 1.5,
-    borderColor: colors.bg,
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 2,
-    shadowColor: "#000",
-    shadowOpacity: 0.35,
-    shadowRadius: 2,
-    shadowOffset: { width: 0, height: 1 },
-  },
-  dealerButtonText: {
-    color: colors.bg,
-    fontSize: 8,
-    fontWeight: "800",
-    letterSpacing: -0.3,
-  },
-  // Host crown — circular gold chip top-right. Mirrors the dealer button
-  // visually so the two corner chips feel like one system.
-  hostChip: {
-    position: "absolute",
-    top: -5,
-    right: -5,
-    width: 16,
-    height: 16,
-    borderRadius: 8,
-    backgroundColor: colors.gold,
-    borderWidth: 1.5,
-    borderColor: colors.bg,
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 2,
-    shadowColor: "#000",
-    shadowOpacity: 0.35,
-    shadowRadius: 2,
-    shadowOffset: { width: 0, height: 1 },
   },
 
   footer: {
