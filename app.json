@@ -9,7 +9,10 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.byronkarlen.pokerstacks"
+      "bundleIdentifier": "com.byronkarlen.pokerstacks",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.byronkarlen.pokerstacks",
