@@ -223,7 +223,13 @@ export const getPotStructure = query({
   },
 });
 
-// Lightweight bundle for the active hand UI: hand + actions + result.
+// Lightweight bundle for the active hand UI: hand + actions + result, plus
+// `canUndo` so the host's Undo button can disable itself when there's
+// nothing meaningful to revert. Mirrors the three cases in undoLastAction:
+//   - showdown with pendingAwards
+//   - any non-blind action in the current hand
+//   - prior hand still recoverable (complete with a handResult), and the
+//     current hand is just the auto-started successor (only blinds posted)
 export const getHandView = query({
   args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
@@ -239,7 +245,32 @@ export const getHandView = query({
       .query("handResults")
       .withIndex("by_hand", (q) => q.eq("handId", hand._id))
       .unique();
-    return { hand, actions, result };
+
+    const hasPendingAwards =
+      !!hand.pendingAwards && hand.pendingAwards.length > 0;
+    const hasNonBlindAction = actions.some(
+      (a) => a.type !== "post_sb" && a.type !== "post_bb",
+    );
+    let prevRecoverable = false;
+    if (!hasPendingAwards && !hasNonBlindAction) {
+      const prev = await ctx.db
+        .query("hands")
+        .withIndex("by_game_and_number", (q) =>
+          q.eq("gameId", table._id).eq("handNumber", hand.handNumber - 1),
+        )
+        .unique();
+      if (prev && prev.street === "complete") {
+        const prevResult = await ctx.db
+          .query("handResults")
+          .withIndex("by_hand", (q) => q.eq("handId", prev._id))
+          .unique();
+        prevRecoverable = !!prevResult;
+      }
+    }
+    const canUndo =
+      hasPendingAwards || hasNonBlindAction || prevRecoverable;
+
+    return { hand, actions, result, canUndo };
   },
 });
 

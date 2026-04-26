@@ -150,7 +150,10 @@ export default function HandScreen() {
     try {
       await undoLastAction({ gameId: table!._id });
     } catch (e) {
-      setUndoError(e instanceof Error ? e.message : "Failed to undo");
+      // Defensive only — the button is disabled when nothing can be undone.
+      // If a race lets a tap through, surface a clean one-liner rather than
+      // the raw Convex stack envelope.
+      setUndoError(parseConvexErrorMessage(e));
     }
   }
 
@@ -169,6 +172,7 @@ export default function HandScreen() {
         handNumber={hand?.handNumber}
         streetText={streetText}
         isHost={isHost}
+        canUndo={handView?.canUndo ?? true}
         onUndo={handleUndo}
         onEndGame={handleEndGame}
       />
@@ -262,6 +266,15 @@ export default function HandScreen() {
 // =============================================================================
 // Pure derivations
 // =============================================================================
+
+// Convex wraps thrown errors with a noisy envelope:
+//   "[CONVEX M(...)] [Request ID: ...] Server Error\nUncaught Error: <msg>\nat handler..."
+// Pull out just <msg> for the user.
+function parseConvexErrorMessage(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const match = raw.match(/Uncaught Error:\s*([^\n]+)/);
+  return (match?.[1] ?? raw).trim();
+}
 
 // Sum of chips each seat has committed on the current betting street. Empty
 // during showdown/complete (no current betting street).

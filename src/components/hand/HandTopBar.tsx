@@ -9,6 +9,7 @@ export function HandTopBar({
   handNumber,
   streetText,
   isHost,
+  canUndo,
   onUndo,
   onEndGame,
 }: {
@@ -16,6 +17,7 @@ export function HandTopBar({
   handNumber: number | undefined;
   streetText: string;
   isHost: boolean;
+  canUndo: boolean;
   onUndo: () => void;
   onEndGame: () => void;
 }) {
@@ -32,8 +34,14 @@ export function HandTopBar({
       </View>
       {isHost ? (
         <View style={styles.actions}>
-          <Pressable onPress={onUndo} hitSlop={8}>
-            <Text style={styles.undoBtn}>Undo</Text>
+          <Pressable
+            onPress={onUndo}
+            hitSlop={8}
+            disabled={!canUndo}
+          >
+            <Text style={[styles.undoBtn, !canUndo && styles.undoBtnDisabled]}>
+              Undo
+            </Text>
           </Pressable>
           <Pressable onPress={onEndGame} hitSlop={8}>
             <Text style={styles.endBtn}>End</Text>
@@ -88,5 +96,8 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
     textTransform: "uppercase",
     paddingVertical: 4,
+  },
+  undoBtnDisabled: {
+    opacity: 0.35,
   },
 });
