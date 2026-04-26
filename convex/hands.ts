@@ -698,6 +698,385 @@ export const recordAction = mutation({
 });
 
 // =============================================================================
+// undoLastAction — host-only rewind of the most recent host/player action.
+//
+// Three cases, picked by inspecting the current hand:
+//   A) Showdown with pendingAwards   → pop the most recent pickPotWinner tap
+//                                      (a tap can land multiple awards via
+//                                      auto-advance, so we pop the trailing
+//                                      block of entries sharing one winner).
+//   B) Current hand has any non-blind action → delete its highest-sequence
+//                                      action, refund chips, re-derive the
+//                                      hand fields from the remaining stream.
+//   C) Current hand has only blinds  → it's the auto-started successor of a
+//                                      hand that just finalized; unwind that
+//                                      finalization and the auto-start.
+//
+// Blinds themselves are not undoable — that's effectively "abort the hand,"
+// which already lives at endGame. Undo cannot cross more than one hand
+// boundary: once the new hand has any non-blind action, the prior hand is
+// sealed.
+// =============================================================================
+
+type DerivedHandState = {
+  pot: number;
+  street: Hand["street"];
+  currentBet: number;
+  minRaise: number;
+  lastFullRaiseSequence: number | undefined;
+  toActSeatIndex: number | undefined;
+};
+
+// Replay an action stream against a hand to derive the fields recordAction
+// would normally maintain. Used after we delete an action so the hand row
+// stays consistent with what's left in `actions`. Mirrors the state machine
+// inside recordAction; if you change one, change the other.
+function deriveHandState(
+  hand: Hand,
+  game: Doc<"games">,
+  actions: Action[],
+  ring: Seat[],
+): DerivedHandState {
+  const sorted = [...actions].sort((a, b) => a.sequence - b.sequence);
+  const pot = sorted.reduce((s, a) => s + a.amount, 0);
+
+  const folded = new Set<Id<"seats">>();
+  const allIn = new Set<Id<"seats">>();
+  for (const a of sorted) {
+    if (a.type === "fold") folded.add(a.seatId);
+    if (a.type === "all_in") allIn.add(a.seatId);
+  }
+
+  // Latest street that has any action. Earliest possible is preflop because
+  // blinds always seed it.
+  const streetOrder: Street[] = ["preflop", "flop", "turn", "river"];
+  let currentStreet: Street = "preflop";
+  for (const s of streetOrder) {
+    if (sorted.some((a) => a.street === s)) currentStreet = s;
+  }
+
+  // Replay actions on the current street to recover currentBet, minRaise,
+  // and lastFullRaiseSequence. Blinds open the street at currentBet=bb.
+  const streetActions = sorted.filter((a) => a.street === currentStreet);
+  let currentBet = 0;
+  let minRaise = game.bigBlind;
+  let lastFullRaiseSequence: number | undefined;
+  const committedStreet = new Map<Id<"seats">, number>();
+
+  for (const a of streetActions) {
+    const prev = committedStreet.get(a.seatId) ?? 0;
+    const newCommit = prev + a.amount;
+    committedStreet.set(a.seatId, newCommit);
+
+    if (a.type === "post_sb" || a.type === "post_bb") {
+      if (newCommit > currentBet) currentBet = newCommit;
+      // Blinds are forced posts, not aggression — leave lastFullRaiseSequence.
+      continue;
+    }
+    if (a.type === "check" || a.type === "fold") continue;
+
+    if (a.type === "bet") {
+      currentBet = newCommit;
+      minRaise = newCommit;
+      lastFullRaiseSequence = a.sequence;
+    } else if (a.type === "raise") {
+      minRaise = newCommit - currentBet;
+      currentBet = newCommit;
+      lastFullRaiseSequence = a.sequence;
+    } else if (a.type === "call") {
+      // call doesn't move currentBet; the only call that exceeds it would
+      // have been recorded as all_in.
+    } else if (a.type === "all_in") {
+      if (newCommit > currentBet) {
+        const raiseDelta = newCommit - currentBet;
+        if (raiseDelta >= minRaise) {
+          minRaise = raiseDelta;
+          lastFullRaiseSequence = a.sequence;
+        }
+        currentBet = newCommit;
+      }
+    }
+  }
+
+  // Single-survivor short-circuit.
+  const survivors = ring.filter((s) => !folded.has(s._id));
+  if (survivors.length === 1) {
+    return {
+      pot,
+      street: "complete",
+      currentBet,
+      minRaise,
+      lastFullRaiseSequence,
+      toActSeatIndex: undefined,
+    };
+  }
+
+  // Did the current street close?
+  const liveActors = survivors.filter((s) => !allIn.has(s._id));
+  const actedThisStreet = new Set<Id<"seats">>();
+  for (const a of streetActions) {
+    if (a.type !== "post_sb" && a.type !== "post_bb") {
+      actedThisStreet.add(a.seatId);
+    }
+  }
+  const streetClosed =
+    liveActors.length > 0 &&
+    liveActors.every(
+      (s) =>
+        actedThisStreet.has(s._id) &&
+        (committedStreet.get(s._id) ?? 0) === currentBet,
+    );
+
+  let nextStreet: Hand["street"] = currentStreet;
+  let toActSeatIndex: number | undefined;
+
+  if (streetClosed) {
+    if (liveActors.length <= 1) {
+      // Everyone left is all-in: skip remaining betting, go straight to
+      // showdown.
+      nextStreet = "showdown";
+      toActSeatIndex = undefined;
+    } else {
+      nextStreet =
+        currentStreet === "preflop"
+          ? "flop"
+          : currentStreet === "flop"
+            ? "turn"
+            : currentStreet === "turn"
+              ? "river"
+              : "showdown";
+      if (nextStreet === "showdown") {
+        toActSeatIndex = undefined;
+      } else {
+        const liveRing = liveActors.sort((a, b) => a.seatIndex - b.seatIndex);
+        const next = nextInRing(liveRing, hand.dealerSeatIndex);
+        toActSeatIndex = next?.seatIndex;
+        currentBet = 0;
+        minRaise = game.bigBlind;
+        lastFullRaiseSequence = undefined;
+      }
+    }
+  } else {
+    // Open street: next live actor clockwise from whoever just acted.
+    // streetActions always has at least the blinds (preflop) or a closing
+    // action that opened this street, so lastAction is defined.
+    const lastAction = streetActions[streetActions.length - 1];
+    const liveRing = liveActors.sort((a, b) => a.seatIndex - b.seatIndex);
+    const lastSeat = ring.find((s) => s._id === lastAction?.seatId);
+    const fromIndex = lastSeat?.seatIndex ?? -1;
+    const next = nextInRing(liveRing, fromIndex);
+    toActSeatIndex = next?.seatIndex ?? liveRing[0]?.seatIndex;
+  }
+
+  return {
+    pot,
+    street: nextStreet,
+    currentBet,
+    minRaise,
+    lastFullRaiseSequence,
+    toActSeatIndex,
+  };
+}
+
+// Patch the hand row to match the state derived from its current actions.
+// Does NOT touch chipStacks — callers handle chip refunds explicitly.
+async function recomputeHandState(
+  ctx: MutationCtx,
+  handId: Id<"hands">,
+): Promise<void> {
+  const hand = await ctx.db.get(handId);
+  if (!hand) throw new Error("Hand not found");
+  const game = await ctx.db.get(hand.gameId);
+  if (!game) throw new Error("Game not found");
+  const actions = await ctx.db
+    .query("actions")
+    .withIndex("by_hand_and_sequence", (q) => q.eq("handId", handId))
+    .collect();
+  const ring = await getActiveSeats(ctx, hand.gameId);
+  const derived = deriveHandState(hand, game, actions, ring);
+  await ctx.db.patch(handId, {
+    pot: derived.pot,
+    street: derived.street,
+    currentBet: derived.currentBet,
+    minRaise: derived.minRaise,
+    lastFullRaiseSequence: derived.lastFullRaiseSequence,
+    toActSeatIndex: derived.toActSeatIndex,
+  });
+}
+
+// `pickPotWinner` auto-advances through pots the same winner is eligible for
+// — one tap can produce a trailing run of entries with the same seatId. To
+// undo "one tap," walk back from the end while seatId stays the same. Returns
+// the slice the array should shrink to.
+function awardsBeforeLastTap(
+  awards: { seatId: Id<"seats">; potIndex: number; amount: number }[],
+): typeof awards {
+  if (awards.length === 0) return awards;
+  const lastSeatId = awards[awards.length - 1].seatId;
+  let cutoff = awards.length - 1;
+  while (cutoff > 0 && awards[cutoff - 1].seatId === lastSeatId) cutoff--;
+  return awards.slice(0, cutoff);
+}
+
+export const undoLastAction = mutation({
+  args: { gameId: v.id("games") },
+  handler: async (ctx, args) => {
+    const userId = await requireAuth(ctx);
+    const game = await ctx.db.get(args.gameId);
+    if (!game) throw new Error("Game not found");
+    if (game.hostUserId !== userId) throw new Error("Host only");
+    if (game.status !== "active") throw new Error("Game is not active");
+    if (!game.currentHandId) throw new Error("Nothing to undo");
+
+    const currentHand = await ctx.db.get(game.currentHandId);
+    if (!currentHand) throw new Error("Nothing to undo");
+
+    // -------- Case A: showdown with pendingAwards — pop one tap. ---------
+    if (currentHand.pendingAwards && currentHand.pendingAwards.length > 0) {
+      const next = awardsBeforeLastTap(currentHand.pendingAwards);
+      await ctx.db.patch(currentHand._id, {
+        pendingAwards: next.length > 0 ? next : undefined,
+      });
+      return null;
+    }
+
+    // -------- Case B: current hand has at least one non-blind action. ----
+    const currentActions = await ctx.db
+      .query("actions")
+      .withIndex("by_hand_and_sequence", (q) =>
+        q.eq("handId", currentHand._id),
+      )
+      .collect();
+    const currentNonBlind = currentActions.filter(
+      (a) => a.type !== "post_sb" && a.type !== "post_bb",
+    );
+    if (currentNonBlind.length > 0) {
+      const last = currentNonBlind.reduce((acc, a) =>
+        a.sequence > acc.sequence ? a : acc,
+      );
+      if (last.amount > 0) {
+        const seat = await ctx.db.get(last.seatId);
+        if (seat) {
+          await ctx.db.patch(seat._id, {
+            chipStack: seat.chipStack + last.amount,
+          });
+        }
+      }
+      await ctx.db.delete(last._id);
+      await recomputeHandState(ctx, currentHand._id);
+      return null;
+    }
+
+    // -------- Case C: only blinds in current hand. Try to unwind the ----
+    //                  prior hand's finalization + this auto-start.
+    const prev = await ctx.db
+      .query("hands")
+      .withIndex("by_game_and_number", (q) =>
+        q.eq("gameId", game._id).eq("handNumber", currentHand.handNumber - 1),
+      )
+      .unique();
+    if (!prev || prev.street !== "complete") {
+      throw new Error("Nothing to undo");
+    }
+    const prevResult = await ctx.db
+      .query("handResults")
+      .withIndex("by_hand", (q) => q.eq("handId", prev._id))
+      .unique();
+    if (!prevResult) throw new Error("Nothing to undo");
+
+    // 1. Tear down the auto-started successor: refund blinds, delete its
+    //    actions, delete the hand row.
+    for (const a of currentActions) {
+      if (a.amount > 0) {
+        const seat = await ctx.db.get(a.seatId);
+        if (seat) {
+          await ctx.db.patch(seat._id, {
+            chipStack: seat.chipStack + a.amount,
+          });
+        }
+      }
+      await ctx.db.delete(a._id);
+    }
+    await ctx.db.delete(currentHand._id);
+
+    // 2. Reverse markBustedSeats for seats that actually played in `prev`
+    //    and are now inactive with 0 chips. We can't tell apart "busted in
+    //    this hand" from "busted earlier" globally, but participation in
+    //    prev means the seat was active at hand-start, so a current
+    //    inactive+0 status was set during prev's completion.
+    const prevActions = await ctx.db
+      .query("actions")
+      .withIndex("by_hand_and_sequence", (q) => q.eq("handId", prev._id))
+      .collect();
+    const seatsInPrev = new Set(prevActions.map((a) => a.seatId));
+    for (const seatId of seatsInPrev) {
+      const seat = await ctx.db.get(seatId);
+      if (seat && seat.status === "inactive" && seat.chipStack === 0) {
+        await ctx.db.patch(seat._id, { status: "active" });
+      }
+    }
+
+    // 3. Debit each award from its winner.
+    for (const award of prevResult.awards) {
+      const seat = await ctx.db.get(award.seatId);
+      if (seat) {
+        await ctx.db.patch(seat._id, {
+          chipStack: seat.chipStack - award.amount,
+        });
+      }
+    }
+    await ctx.db.delete(prevResult._id);
+
+    // 4. Restore the game pointer to prev so the screen renders it again.
+    await ctx.db.patch(game._id, {
+      currentHandId: prev._id,
+      dealerSeatIndex: prev.dealerSeatIndex,
+    });
+
+    // 5. Decide which kind of completion this was, and walk prev one step
+    //    back from "complete":
+    //
+    //      single-survivor → last action was a fold; delete it.
+    //      pickPotWinner    → no betting action to delete; just restore
+    //                          showdown + pendingAwards from the saved
+    //                          handResults (trailing-tap heuristic).
+    const ring = await getActiveSeats(ctx, prev.gameId);
+    const derived = deriveHandState(prev, game, prevActions, ring);
+
+    if (derived.street === "complete") {
+      // Single-survivor: drop the fold that ended it.
+      const sortedActions = [...prevActions].sort(
+        (a, b) => b.sequence - a.sequence,
+      );
+      const last = sortedActions[0];
+      if (last) {
+        if (last.amount > 0) {
+          const seat = await ctx.db.get(last.seatId);
+          if (seat) {
+            await ctx.db.patch(seat._id, {
+              chipStack: seat.chipStack + last.amount,
+            });
+          }
+        }
+        await ctx.db.delete(last._id);
+      }
+      await recomputeHandState(ctx, prev._id);
+    } else {
+      // pickPotWinner finalization: revert to showdown with the pendingAwards
+      // that were live just before the final tap.
+      const restored = awardsBeforeLastTap(prevResult.awards);
+      await ctx.db.patch(prev._id, {
+        street: "showdown",
+        toActSeatIndex: undefined,
+        pendingAwards: restored.length > 0 ? restored : undefined,
+      });
+    }
+
+    return null;
+  },
+});
+
+// =============================================================================
 // pickPotWinner — incremental showdown resolution.
 //
 // Each pot gets picked with its own mutation call so every client stays in

@@ -3,18 +3,20 @@ import { colors } from "@/theme";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 // Top of the hand screen: hand number and street label on the left, table
-// stakes/code under it; "End" button on the right (host only).
+// stakes/code under it; "Undo" + "End" buttons on the right (host only).
 export function HandTopBar({
   table,
   handNumber,
   streetText,
   isHost,
+  onUndo,
   onEndGame,
 }: {
   table: Doc<"games">;
   handNumber: number | undefined;
   streetText: string;
   isHost: boolean;
+  onUndo: () => void;
   onEndGame: () => void;
 }) {
   return (
@@ -29,9 +31,14 @@ export function HandTopBar({
         </Text>
       </View>
       {isHost ? (
-        <Pressable onPress={onEndGame} hitSlop={8}>
-          <Text style={styles.endBtn}>End</Text>
-        </Pressable>
+        <View style={styles.actions}>
+          <Pressable onPress={onUndo} hitSlop={8}>
+            <Text style={styles.undoBtn}>Undo</Text>
+          </Pressable>
+          <Pressable onPress={onEndGame} hitSlop={8}>
+            <Text style={styles.endBtn}>End</Text>
+          </Pressable>
+        </View>
       ) : null}
     </View>
   );
@@ -63,6 +70,19 @@ const styles = StyleSheet.create({
   },
   endBtn: {
     color: colors.danger,
+    fontSize: 13,
+    fontWeight: "700",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    paddingVertical: 4,
+  },
+  actions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+  },
+  undoBtn: {
+    color: colors.mute,
     fontSize: 13,
     fontWeight: "700",
     letterSpacing: 1,

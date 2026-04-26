@@ -76,7 +76,9 @@ export default function HandScreen() {
 
   const startHand = useMutation(api.hands.startHand);
   const endGame = useMutation(api.games.endGame);
+  const undoLastAction = useMutation(api.hands.undoLastAction);
   const [endError, setEndError] = useState<string | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
 
   useTableLifecycleRouting(table?.status, code, router);
   useFirstHandAutoStart({ table, userId, startHand });
@@ -142,6 +144,16 @@ export default function HandScreen() {
     }
   }
 
+  async function handleUndo() {
+    setUndoError(null);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    try {
+      await undoLastAction({ gameId: table!._id });
+    } catch (e) {
+      setUndoError(e instanceof Error ? e.message : "Failed to undo");
+    }
+  }
+
   // Dealer button position. Before the first hand starts the table stores
   // -1; hands.ts treats that as seat 0 (the host), so we display it there.
   const dealerSeatIndex = hand
@@ -157,9 +169,11 @@ export default function HandScreen() {
         handNumber={hand?.handNumber}
         streetText={streetText}
         isHost={isHost}
+        onUndo={handleUndo}
         onEndGame={handleEndGame}
       />
       {endError ? <Text style={styles.errorInline}>{endError}</Text> : null}
+      {undoError ? <Text style={styles.errorInline}>{undoError}</Text> : null}
 
       <View style={styles.tableWrap}>
         <OvalFelt>
