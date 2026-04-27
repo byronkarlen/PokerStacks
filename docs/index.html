@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PokerStacks — Support</title>
+    <meta
+      name="description"
+      content="Support and help for PokerStacks, the companion app for in-person poker games."
+    />
+    <style>
+      :root {
+        --bg: #0b1410;
+        --surface: #152921;
+        --raised: #1b3529;
+        --hair: rgba(201, 169, 97, 0.16);
+        --text: #f3ece0;
+        --mute: #8a9890;
+        --gold: #c9a961;
+        --ivory: #f5ecd9;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+      }
+      main {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 56px 24px 80px;
+      }
+      .kicker {
+        color: var(--gold);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 1.4px;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+      }
+      h1 {
+        font-family: Georgia, serif;
+        font-style: italic;
+        color: var(--ivory);
+        font-size: 40px;
+        margin: 0 0 8px;
+        letter-spacing: -0.5px;
+      }
+      .tagline {
+        color: var(--mute);
+        font-size: 15px;
+        margin: 0 0 40px;
+      }
+      h2 {
+        color: var(--ivory);
+        font-size: 18px;
+        margin: 36px 0 12px;
+        letter-spacing: 0.2px;
+      }
+      p,
+      li {
+        color: var(--text);
+        font-size: 15px;
+      }
+      a {
+        color: var(--gold);
+        text-decoration: none;
+        border-bottom: 1px solid rgba(201, 169, 97, 0.4);
+      }
+      a:hover {
+        border-bottom-color: var(--gold);
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--hair);
+        border-radius: 12px;
+        padding: 20px 22px;
+        margin: 12px 0;
+      }
+      .card strong {
+        color: var(--ivory);
+      }
+      ul {
+        padding-left: 20px;
+      }
+      li {
+        margin: 6px 0;
+      }
+      footer {
+        margin-top: 56px;
+        padding-top: 24px;
+        border-top: 1px solid var(--hair);
+        color: var(--mute);
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="kicker">PokerStacks</div>
+      <h1>Support</h1>
+      <p class="tagline">
+        Companion app for in-person poker games. Real cards, virtual chips,
+        no sign-in.
+      </p>
+
+      <h2>Contact</h2>
+      <div class="card">
+        <p style="margin: 0">
+          Email:
+          <a href="mailto:wbyronkarlen@gmail.com">wbyronkarlen@gmail.com</a>
+        </p>
+        <p style="margin: 8px 0 0">
+          Bugs and feature requests:
+          <a
+            href="https://github.com/byronkarlen/PokerStacks/issues"
+            target="_blank"
+            rel="noopener"
+            >GitHub Issues</a
+          >
+        </p>
+      </div>
+
+      <h2>Frequently asked</h2>
+
+      <div class="card">
+        <p><strong>How do I start a game?</strong></p>
+        <p style="margin: 8px 0 0">
+          Tap <em>Start a game</em> on the welcome screen. You'll get a
+          4-character code to share with the rest of the table — anyone with
+          the code can join from <em>Join a game</em> on their own phone.
+        </p>
+      </div>
+
+      <div class="card">
+        <p><strong>Someone made a mistake mid-hand. Can we fix it?</strong></p>
+        <p style="margin: 8px 0 0">
+          Yes. The host has an <em>Undo</em> button at the top of the hand
+          screen. It rewinds the most recent action — the last bet, fold,
+          check, or showdown winner pick. Tap it again to undo more.
+        </p>
+      </div>
+
+      <div class="card">
+        <p><strong>The host's phone died. What now?</strong></p>
+        <p style="margin: 8px 0 0">
+          Re-opening the app on the same device restores host powers
+          automatically. If the phone is gone for good, the table can't
+          continue — settle up at the table from the chip counts shown on
+          everyone else's phones.
+        </p>
+      </div>
+
+      <div class="card">
+        <p><strong>Does PokerStacks deal cards?</strong></p>
+        <p style="margin: 8px 0 0">
+          No. PokerStacks tracks chips, pots, and bets only. Use a real deck
+          and let the players decide who won — the app distributes the pot
+          accordingly.
+        </p>
+      </div>
+
+      <div class="card">
+        <p><strong>Is my data shared anywhere?</strong></p>
+        <p style="margin: 8px 0 0">
+          PokerStacks doesn't collect personal information. There's no
+          sign-in, and no card data is ever stored. Game state lives on the
+          app's backend (Convex) only as long as the session is active.
+        </p>
+      </div>
+
+      <h2>Reporting a problem</h2>
+      <p>
+        The fastest way to get a bug fixed is to open an issue on
+        <a
+          href="https://github.com/byronkarlen/PokerStacks/issues/new"
+          target="_blank"
+          rel="noopener"
+          >GitHub</a
+        >
+        with:
+      </p>
+      <ul>
+        <li>What you were doing when it happened</li>
+        <li>What you expected to happen</li>
+        <li>What actually happened</li>
+        <li>Your device + OS version (e.g. iPhone 15, iOS 18.1)</li>
+      </ul>
+
+      <footer>
+        © PokerStacks · iOS &amp; Android only ·
+        <a href="mailto:wbyronkarlen@gmail.com">wbyronkarlen@gmail.com</a>
+      </footer>
+    </main>
+  </body>
+</html>
