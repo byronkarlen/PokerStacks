@@ -50,6 +50,12 @@
         "projectId": "69de7887-e931-4306-82bb-e91478277a84"
       }
     },
-    "owner": "byronkarlen"
+    "owner": "byronkarlen",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/69de7887-e931-4306-82bb-e91478277a84"
+    }
   }
 }
