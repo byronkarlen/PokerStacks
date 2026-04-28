@@ -9,6 +9,9 @@
       "distribution": "internal",
       "channel": "development",
       "environment": "development",
+      "env": {
+        "EXPO_USE_PRECOMPILED_MODULES": "0"
+      },
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     },
@@ -16,6 +19,9 @@
       "distribution": "internal",
       "channel": "preview",
       "environment": "preview",
+      "env": {
+        "EXPO_USE_PRECOMPILED_MODULES": "0"
+      },
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     },
@@ -23,6 +29,9 @@
       "autoIncrement": true,
       "channel": "production",
       "environment": "production",
+      "env": {
+        "EXPO_USE_PRECOMPILED_MODULES": "0"
+      },
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     }
