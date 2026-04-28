@@ -8,24 +8,21 @@
       "developmentClient": true,
       "distribution": "internal",
       "channel": "development",
+      "environment": "development",
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     },
     "preview": {
       "distribution": "internal",
-      "env": {
-        "EXPO_PUBLIC_CONVEX_URL": "https://glorious-mallard-484.convex.cloud"
-      },
       "channel": "preview",
+      "environment": "preview",
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     },
     "production": {
       "autoIncrement": true,
-      "env": {
-        "EXPO_PUBLIC_CONVEX_URL": "https://precious-stork-943.convex.cloud"
-      },
       "channel": "production",
+      "environment": "production",
       "ios": { "image": "latest" },
       "android": { "image": "latest" }
     }
