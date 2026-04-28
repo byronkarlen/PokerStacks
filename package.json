@@ -20,7 +20,6 @@
     "@react-navigation/native": "^7.1.8",
     "convex": "^1.35.1",
     "expo": "~55.0.17",
-    "expo-build-properties": "~55.0.13",
     "expo-clipboard": "~55.0.13",
     "expo-constants": "~55.0.14",
     "expo-dev-client": "~55.0.28",
