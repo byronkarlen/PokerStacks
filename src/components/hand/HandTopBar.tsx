@@ -3,7 +3,7 @@ import { colors } from "@/theme";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 // Top of the hand screen: hand number and street label on the left, table
-// stakes/code under it; "Undo" + "End" buttons on the right (host only).
+// stakes/code under it; "End" is visible to every player, "Undo" is host-only.
 export function HandTopBar({
   table,
   handNumber,
@@ -32,22 +32,18 @@ export function HandTopBar({
           {table.smallBlind}/{table.bigBlind} · {table.code}
         </Text>
       </View>
-      {isHost ? (
-        <View style={styles.actions}>
-          <Pressable
-            onPress={onUndo}
-            hitSlop={8}
-            disabled={!canUndo}
-          >
+      <View style={styles.actions}>
+        {isHost ? (
+          <Pressable onPress={onUndo} hitSlop={8} disabled={!canUndo}>
             <Text style={[styles.undoBtn, !canUndo && styles.undoBtnDisabled]}>
               Undo
             </Text>
           </Pressable>
-          <Pressable onPress={onEndGame} hitSlop={8}>
-            <Text style={styles.endBtn}>End</Text>
-          </Pressable>
-        </View>
-      ) : null}
+        ) : null}
+        <Pressable onPress={onEndGame} hitSlop={8}>
+          <Text style={styles.endBtn}>End</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }

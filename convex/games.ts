@@ -241,12 +241,14 @@ export const startGame = mutation({
   },
 });
 
-// Host-only: end the game, settling outstanding seats. Goes to settlement.
+// Any signed-in player can end the game; settles outstanding seats and
+// goes to settlement.
 export const endGame = mutation({
   args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
-    const userId = await requireAuth(ctx);
-    const game = await requireHost(ctx, args.gameId, userId);
+    await requireAuth(ctx);
+    const game = await ctx.db.get(args.gameId);
+    if (!game) throw new Error("Game not found");
     // Idempotent.
     if (game.status === "ended") return null;
 
