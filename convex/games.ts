@@ -221,8 +221,9 @@ export const leaveGame = mutation({
 export const startGame = mutation({
   args: { gameId: v.id("games") },
   handler: async (ctx, args) => {
-    const userId = await requireAuth(ctx);
-    const game = await requireHost(ctx, args.gameId, userId);
+    await requireAuth(ctx);
+    const game = await ctx.db.get(args.gameId);
+    if (!game) throw new Error("Game not found");
     if (game.status !== "lobby") {
       throw new Error("Game already started");
     }

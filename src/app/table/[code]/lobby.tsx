@@ -13,9 +13,9 @@ import { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-// Pre-game lobby. Players see the table code, watch others join, the host
+// Pre-game lobby. Players see the table code, watch others join, anyone
 // presses "Start" once at least 2 are seated. Auto-redirects to /hand when
-// the host starts, or back home if the game is canceled.
+// the game starts, or back home if the host cancels.
 export default function Lobby() {
   const router = useRouter();
   const { code: codeParam } = useLocalSearchParams<{ code: string }>();
@@ -58,7 +58,7 @@ export default function Lobby() {
 
   const isHost = !!userId && table.hostUserId === userId;
   const readyCount = seats.filter((s) => s.status === "active").length;
-  const canStart = isHost && readyCount >= 2;
+  const canStart = readyCount >= 2;
   const buyInBigBlinds = table.defaultBuyIn / table.bigBlind;
   const totalChipsOnTable = seats.reduce((sum, s) => sum + s.chipStack, 0);
   const totalChipsInBigBlinds = totalChipsOnTable / table.bigBlind;
@@ -148,42 +148,35 @@ export default function Lobby() {
 
       <View style={styles.footer}>
         {startError ? <Text style={styles.error}>{startError}</Text> : null}
+        <Pressable
+          onPress={handleStart}
+          disabled={!canStart}
+          style={[styles.cta, !canStart && styles.ctaDisabled]}
+        >
+          <Text style={styles.ctaText}>Start game</Text>
+        </Pressable>
         {isHost ? (
-          <>
-            <Pressable
-              onPress={handleStart}
-              disabled={!canStart}
-              style={[styles.cta, !canStart && styles.ctaDisabled]}
-            >
-              <Text style={styles.ctaText}>Start game</Text>
-            </Pressable>
-            <Pressable
-              onPress={handleCancel}
-              disabled={canceling}
-              style={styles.cancel}
-              hitSlop={8}
-            >
-              <Text style={styles.cancelText}>
-                {canceling ? "Canceling…" : "Cancel"}
-              </Text>
-            </Pressable>
-          </>
-        ) : (
-          <>
-            <Text style={styles.waitingForHost}>
-              Waiting for host to start…
+          <Pressable
+            onPress={handleCancel}
+            disabled={canceling}
+            style={styles.cancel}
+            hitSlop={8}
+          >
+            <Text style={styles.cancelText}>
+              {canceling ? "Canceling…" : "Cancel"}
             </Text>
-            <Pressable
-              onPress={handleLeave}
-              disabled={leaving}
-              style={styles.cancel}
-              hitSlop={8}
-            >
-              <Text style={styles.cancelText}>
-                {leaving ? "Leaving…" : "Leave"}
-              </Text>
-            </Pressable>
-          </>
+          </Pressable>
+        ) : (
+          <Pressable
+            onPress={handleLeave}
+            disabled={leaving}
+            style={styles.cancel}
+            hitSlop={8}
+          >
+            <Text style={styles.cancelText}>
+              {leaving ? "Leaving…" : "Leave"}
+            </Text>
+          </Pressable>
         )}
       </View>
     </SafeAreaView>
@@ -269,12 +262,6 @@ const styles = StyleSheet.create({
     color: "#c99895",
     fontSize: 13,
     fontWeight: "600",
-  },
-  waitingForHost: {
-    color: colors.mute,
-    textAlign: "center",
-    fontSize: 14,
-    paddingVertical: 14,
   },
   error: {
     color: colors.danger,
